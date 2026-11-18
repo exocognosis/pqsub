@@ -1,0 +1,5 @@
+--- a/billing/src/retry.rs
++++ b/billing/src/retry.rs
+@@ -88 +88 @@
+-    arm_timer(); drop(guard);
++    drop(guard); arm_timer();

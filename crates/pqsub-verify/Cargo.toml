@@ -1,0 +1,19 @@
+[package]
+name = "pqsub-verify"
+description = "Independent verifier for pqsub transcripts (fips204-based; shares no code with pqsub-core)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fips204.workspace = true
+sha3.workspace = true
+subtle.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+# Dev-only: used for cross-implementation tests. The verifier itself never links pqsub-core.
+pqsub-core = { path = "../pqsub-core" }

@@ -1,0 +1,1 @@
+Root cause: retry timer is armed before the lock is released; under contention the reset races.

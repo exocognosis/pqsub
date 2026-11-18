@@ -1,0 +1,1 @@
+cargo test -p billing --locked -- --test-threads=1 (sandbox: no network, read-only FS outside target/)

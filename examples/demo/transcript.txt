@@ -1,0 +1,44 @@
+== identities (4) ==
+  orchestrator  role=orchestrator  id=2c9c63f3f952393d… valid=[1767225600000, 1769817600000] issuer=97a23beeca09961a…
+  researcher    role=research      id=ccbe1c7cb0171015… valid=[1767225600000, 1769817600000] issuer=97a23beeca09961a…
+  coder         role=engineering   id=954b7e68ef69d86b… valid=[1767225600000, 1769817600000] issuer=97a23beeca09961a…
+  reviewer      role=review        id=e24070a7d0305887… valid=[1767225600000, 1769817600000] issuer=97a23beeca09961a…
+== entries (6 total, showing from #0) ==
+#0 HANDOFF  orchestrator -> researcher  seq=0 ts=1767225660000
+    intent : Investigate flaky test in `billing` (task T-42)
+    payload: cb03aa78e283b04fd6113291c7c67738db7416d69340e4e3274d9ecd118fa3e2
+    prev   : 0000000000000000000000000000000000000000000000000000000000000000
+    hash   : 71fd57ddb1d81f9832ffba28216456b2f34c942b77ce90bb027e9f8329ce9c92
+    sig    : e36cf346cbafb2442a377927… (3309 bytes ML-DSA-65)
+#1 HANDOFF  researcher -> coder  seq=0 ts=1767225720000
+    intent : Root cause identified; implement fix
+    payload: 05219d744c9ba78757388c5069016980044a5de76f75f08419a8a946cb8a8ff8
+    prev   : 71fd57ddb1d81f9832ffba28216456b2f34c942b77ce90bb027e9f8329ce9c92
+    hash   : dbe19a08d357b09ced1b2ddfd314845194471e76855b512809fc181361a52e41
+    sig    : 55c93ea7e847c2168d005428… (3309 bytes ML-DSA-65)
+#2 TOOL-AUTH coder -> role:sandbox-runner  seq=0 ts=1767225780000
+    intent : Run billing test suite in sandbox
+    payload: ced7d9d3720e36cd35e1bba7f19289f76ac7e4eeca8958fd198f568a38987450
+    prev   : dbe19a08d357b09ced1b2ddfd314845194471e76855b512809fc181361a52e41
+    hash   : 8a16e393e57f4bd3c731bba16e861524ccb86c81af0bc0adb625bac1329f7641
+    sig    : a791300bc99019d2edf03282… (3309 bytes ML-DSA-65)
+#3 HANDOFF  coder -> reviewer  seq=1 ts=1767225840000
+    intent : Patch ready for review (1 file, 1 hunk)
+    payload: b084d993956ce211dc186e170a247dda2274bf6ad3baad4cf5b563539e52e4c3
+    prev   : 8a16e393e57f4bd3c731bba16e861524ccb86c81af0bc0adb625bac1329f7641
+    hash   : 007c1548bfac1af79b9c33e1a0cd0995f968c63556003929d881f30f6a40d864
+    sig    : c93eb82ef58e5980d5594dba… (3309 bytes ML-DSA-65)
+#4 ACTION   reviewer -> orchestrator  seq=0 ts=1767225900000
+    intent : Reviewed patch: APPROVE
+    payload: 9150ae25a45ef12e04c75c943ba863825e31db8c8f7b5309fbe8f23769609bbc
+    prev   : 007c1548bfac1af79b9c33e1a0cd0995f968c63556003929d881f30f6a40d864
+    hash   : 711e04b3f3b826b4ba00385b3aee5a01cb2bd839c76141fa21752f30c1713b07
+    sig    : c361d8b599e87e0463456d52… (3309 bytes ML-DSA-65)
+#5 TOOL-AUTH orchestrator -> role:merge-bot  seq=1 ts=1767225960000
+    intent : Merge T-42 patch into main
+    payload: 6767cbb8e82ef41c30ac6a81b814d77b59227f065b4182bf72be0b887ef93be2
+    prev   : 711e04b3f3b826b4ba00385b3aee5a01cb2bd839c76141fa21752f30c1713b07
+    hash   : f68a22dcbbbfff307b8c82bdcb5b83e1e956bea251c0f8fc848a433cb41dd029
+    sig    : 42e01695317cd63febb9d85c… (3309 bytes ML-DSA-65)
+== verification ==
+  OK: 6 entries verified, anchored=true, head=f68a22dcbbbfff307b8c82bdcb5b83e1e956bea251c0f8fc848a433cb41dd029
