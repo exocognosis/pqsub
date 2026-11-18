@@ -1,0 +1,33 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the compiler; rustup installs it on first use.
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked --release
+      - name: independent verifier accepts committed test vectors
+        run: |
+          cargo build --release --locked
+          ./target/release/pqsub-verify vectors test-vectors/vectors.json
+          ./target/release/pqsub-verify vectors-v2 test-vectors/vectors-v2.json
+      - name: committed demo transcripts verify and audit as documented
+        run: |
+          ./target/release/pqsub-verify transcript --root examples/demo/root.pub examples/demo/transcript.pqst --expect-head "$(cat examples/demo/head.txt)"
+          ./target/release/pqsub-verify audit --root examples/v2-audit/root.pub examples/v2-audit/honest-executor.pqst --require-authorized
+          ! ./target/release/pqsub-verify audit --root examples/v2-audit/root.pub examples/v2-audit/rogue-executor.pqst --require-authorized
