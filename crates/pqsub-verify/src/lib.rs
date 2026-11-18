@@ -12,7 +12,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fips204::ml_dsa_65;
 use fips204::traits::{SerDes, Verifier};
@@ -25,7 +25,12 @@ pub const PK_LEN: usize = 1952;
 pub const SIG_LEN: usize = 3309;
 const CTX_IDENTITY: &[u8] = b"pqsub/v1/identity";
 const CTX_MANIFEST: &[u8] = b"pqsub/v1/manifest";
-const D_AGENT_ID: &[u8] = b"pqsub/v1/agent-id";
+const CTX_MANIFEST_V2: &[u8] = b"pqsub/v2/manifest";
+pub(crate) const CTX_GRANT: &[u8] = b"pqsub/v2/grant";
+pub(crate) const D_GRANT_ID: &[u8] = b"pqsub/v2/grant-id";
+const MAX_GRANTS: usize = 4096;
+const MAX_CHAIN: u8 = 8;
+pub(crate) const D_AGENT_ID: &[u8] = b"pqsub/v1/agent-id";
 const D_ENTRY: &[u8] = b"pqsub/v1/entry";
 const MAX_IDENTITIES: usize = 1024;
 const MAX_ENTRIES: usize = 1 << 20;
@@ -33,7 +38,7 @@ const MAX_ITEM_LEN: usize = 16 * 1024;
 const MAX_LABEL: usize = 64;
 const MAX_INTENT: usize = 1024;
 
-type H32 = [u8; 32];
+pub(crate) type H32 = [u8; 32];
 
 /// A verification failure with a stable code (identical to `pqsub-core` codes).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,7 +49,7 @@ pub struct Failure {
     pub detail: String,
 }
 
-fn fail<T>(code: &'static str, detail: impl Into<String>) -> Result<T, Failure> {
+pub(crate) fn fail<T>(code: &'static str, detail: impl Into<String>) -> Result<T, Failure> {
     Err(Failure {
         code,
         detail: detail.into(),
@@ -87,7 +92,7 @@ pub fn hd(domain: &[u8], data: &[u8]) -> H32 {
     h.finalize().into()
 }
 
-fn ct(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn ct(a: &[u8], b: &[u8]) -> bool {
     bool::from(a.ct_eq(b))
 }
 
@@ -105,13 +110,16 @@ pub fn mldsa_verify(pk: &[u8], msg: &[u8], ctx: &[u8], sig: &[u8]) -> bool {
 
 // ------------------------------------------------------------------ parsing
 
-struct Cur<'a> {
-    b: &'a [u8],
-    p: usize,
+pub(crate) struct Cur<'a> {
+    pub(crate) b: &'a [u8],
+    pub(crate) p: usize,
 }
 
 impl<'a> Cur<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], Failure> {
+    pub(crate) fn new(b: &'a [u8]) -> Self {
+        Cur { b, p: 0 }
+    }
+    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], Failure> {
         let end = self.p.checked_add(n).filter(|&e| e <= self.b.len());
         match end {
             Some(e) => {
@@ -122,27 +130,61 @@ impl<'a> Cur<'a> {
             None => fail("DECODE", "truncated"),
         }
     }
-    fn h32(&mut self) -> Result<H32, Failure> {
+    pub(crate) fn h32(&mut self) -> Result<H32, Failure> {
         let mut a = [0u8; 32];
         a.copy_from_slice(self.take(32)?);
         Ok(a)
     }
-    fn be(&mut self, n: usize) -> Result<u64, Failure> {
+    pub(crate) fn be(&mut self, n: usize) -> Result<u64, Failure> {
         Ok(self
             .take(n)?
             .iter()
             .fold(0u64, |acc, &x| (acc << 8) | u64::from(x)))
     }
-    fn header(&mut self, magic: &[u8; 4]) -> Result<(), Failure> {
+    pub(crate) fn header(&mut self, magic: &[u8; 4]) -> Result<(), Failure> {
+        self.header_versions(magic, 1, 1).map(|_| ())
+    }
+    /// Magic followed by a version byte in `lo..=hi`; returns the version.
+    pub(crate) fn header_versions(
+        &mut self,
+        magic: &[u8; 4],
+        lo: u8,
+        hi: u8,
+    ) -> Result<u8, Failure> {
         if self.take(4)? != magic {
             return fail("DECODE", "magic");
         }
-        if self.be(1)? != 1 {
+        let v = self.u8()?;
+        if v < lo || v > hi {
             return fail("DECODE", "version");
         }
-        Ok(())
+        Ok(v)
     }
-    fn text(&mut self, len_bytes: usize, max: usize) -> Result<String, Failure> {
+    pub(crate) fn u8(&mut self) -> Result<u8, Failure> {
+        let s = self.take(1)?;
+        match s.first() {
+            Some(&x) => Ok(x),
+            None => fail("DECODE", "truncated"),
+        }
+    }
+    /// Length-prefixed UTF-8 string with length in `min..=max`.
+    pub(crate) fn str_range(
+        &mut self,
+        len_bytes: usize,
+        min: usize,
+        max: usize,
+    ) -> Result<String, Failure> {
+        let n = self.be(len_bytes)?;
+        let n = usize::try_from(n).unwrap_or(usize::MAX);
+        if n < min || n > max {
+            return fail("DECODE", "string length");
+        }
+        match std::str::from_utf8(self.take(n)?) {
+            Ok(s) => Ok(s.to_owned()),
+            Err(_) => fail("DECODE", "utf-8"),
+        }
+    }
+    pub(crate) fn text(&mut self, len_bytes: usize, max: usize) -> Result<String, Failure> {
         let n = self.be(len_bytes)? as usize;
         if n == 0 || n > max {
             return fail("DECODE", "string length");
@@ -152,7 +194,7 @@ impl<'a> Cur<'a> {
             Err(_) => fail("DECODE", "utf-8"),
         }
     }
-    fn end(&self) -> Result<(), Failure> {
+    pub(crate) fn end(&self) -> Result<(), Failure> {
         if self.p == self.b.len() {
             Ok(())
         } else {
@@ -161,11 +203,12 @@ impl<'a> Cur<'a> {
     }
 }
 
-struct Ident<'a> {
+pub(crate) struct Ident<'a> {
     body: &'a [u8],
-    agent_id: H32,
-    pk: &'a [u8],
+    pub(crate) agent_id: H32,
+    pub(crate) pk: &'a [u8],
     name: String,
+    pub(crate) role: String,
     nb: u64,
     na: u64,
     issuer: H32,
@@ -178,7 +221,7 @@ fn parse_ident(b: &[u8]) -> Result<Ident<'_>, Failure> {
     let agent_id = c.h32()?;
     let pk = c.take(PK_LEN)?;
     let name = c.text(1, MAX_LABEL)?;
-    let _role = c.text(1, MAX_LABEL)?;
+    let role = c.text(1, MAX_LABEL)?;
     let nb = c.be(8)?;
     let na = c.be(8)?;
     if nb > na {
@@ -193,6 +236,7 @@ fn parse_ident(b: &[u8]) -> Result<Ident<'_>, Failure> {
         agent_id,
         pk,
         name,
+        role,
         nb,
         na,
         issuer,
@@ -200,52 +244,120 @@ fn parse_ident(b: &[u8]) -> Result<Ident<'_>, Failure> {
     })
 }
 
-struct Entry<'a> {
-    body: &'a [u8],
-    sender: H32,
-    seq: u64,
-    ts: u64,
-    prev: H32,
-    sig: &'a [u8],
+/// Manifest recipient.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Recipient {
+    Agent(H32),
+    Role(String),
 }
 
-fn parse_entry(b: &[u8]) -> Result<Entry<'_>, Failure> {
+/// Kind-specific v2 manifest fields.
+pub(crate) enum Ext {
+    /// Kinds 1..=3.
+    None,
+    /// Kind 4: tool call.
+    Call {
+        tool: String,
+        args: cjson::Value,
+        chain: Vec<H32>,
+    },
+    /// Kind 5: receipt.
+    Receipt {
+        call_ref: H32,
+        status: u8,
+        reason: u8,
+    },
+}
+
+pub(crate) struct Entry<'a> {
+    body: &'a [u8],
+    version: u8,
+    pub(crate) sender: H32,
+    pub(crate) recipient: Recipient,
+    seq: u64,
+    pub(crate) ts: u64,
+    prev: H32,
+    sig: &'a [u8],
+    pub(crate) ext: Ext,
+}
+
+fn parse_entry(b: &[u8], allow_v2: bool) -> Result<Entry<'_>, Failure> {
     let mut c = Cur { b, p: 0 };
-    c.header(b"PQSM")?;
-    if !(1..=3).contains(&c.be(1)?) {
+    let version = c.header_versions(b"PQSM", 1, if allow_v2 { 2 } else { 1 })?;
+    let kind = c.u8()?;
+    let max_kind = if version == 1 { 3 } else { 5 };
+    if !(1..=max_kind).contains(&kind) {
         return fail("DECODE", "kind");
     }
     let sender = c.h32()?;
-    match c.be(1)? {
-        1 => {
-            c.h32()?;
-        }
-        2 => {
-            c.text(1, MAX_LABEL)?;
-        }
+    let recipient = match c.u8()? {
+        1 => Recipient::Agent(c.h32()?),
+        2 => Recipient::Role(c.text(1, MAX_LABEL)?),
         _ => return fail("DECODE", "recipient tag"),
-    }
+    };
     let seq = c.be(8)?;
     let ts = c.be(8)?;
     let prev = c.h32()?;
     c.text(2, MAX_INTENT)?;
-    match c.be(1)? {
+    match c.u8()? {
         0 => {}
         1 => {
             c.h32()?;
         }
         _ => return fail("DECODE", "payload flag"),
     }
+    let ext = match kind {
+        4 => {
+            let tool = caveat::tool_name(&mut c)?;
+            let n = c.be(2)? as usize;
+            let raw = c.take(n)?;
+            let Some(args) = cjson::parse(raw, true) else {
+                return fail("DECODE", "args are not canonical JSON");
+            };
+            let n = c.u8()?;
+            if !(1..=MAX_CHAIN).contains(&n) {
+                return fail("DECODE", "grant chain length");
+            }
+            let mut chain = Vec::with_capacity(usize::from(n));
+            for _ in 0..n {
+                chain.push(c.h32()?);
+            }
+            Ext::Call { tool, args, chain }
+        }
+        5 => {
+            let call_ref = c.h32()?;
+            let status = c.u8()?;
+            let reason = c.u8()?;
+            let result_hash = c.h32()?;
+            let ok = match status {
+                0 | 1 => reason == 0,
+                2 => (2..=8).contains(&reason) && result_hash == [0u8; 32],
+                _ => false,
+            };
+            if !ok {
+                return fail("DECODE", "receipt fields");
+            }
+            Ext::Receipt {
+                call_ref,
+                status,
+                reason,
+            }
+        }
+        _ => Ext::None,
+    };
     let body_end = c.p;
     let sig = c.take(SIG_LEN)?;
     c.end()?;
     Ok(Entry {
         body: &b[..body_end],
+        version,
         sender,
+        recipient,
         seq,
         ts,
         prev,
         sig,
+        ext,
     })
 }
 
@@ -274,26 +386,26 @@ pub fn parse_root(b: &[u8]) -> Result<Vec<u8>, Failure> {
 
 // ------------------------------------------------------------------ verification
 
-/// Verify transcript bytes against `root_pk` (raw 1952 bytes).
-///
-/// # Errors
-/// The first failure, with a code matching `pqsub-core`.
-pub fn verify_transcript(
-    root_pk: &[u8],
-    transcript: &[u8],
-    from: usize,
-    anchor: Anchor,
-    expected_head: Option<H32>,
-) -> Result<Report, Failure> {
-    if root_pk.len() != PK_LEN {
-        return fail("DECODE", "root public key length");
-    }
-    // 1. Strict decode of the whole container.
+/// Verified-identity map, grant map and window of a verified transcript.
+pub(crate) struct Parsed<'a> {
+    pub(crate) idents: HashMap<H32, &'a Ident<'a>>,
+    pub(crate) grants: HashMap<H32, &'a grant::Grant<'a>>,
+    pub(crate) window: &'a [Entry<'a>],
+}
+
+/// Strictly decoded transcript container (DESIGN §3 step 1, V2 §14.7).
+pub(crate) struct Decoded<'a> {
+    ids: Vec<Ident<'a>>,
+    grants: Vec<grant::Grant<'a>>,
+    entries: Vec<Entry<'a>>,
+}
+
+pub(crate) fn decode_transcript(transcript: &[u8]) -> Result<Decoded<'_>, Failure> {
     let mut c = Cur {
         b: transcript,
         p: 0,
     };
-    c.header(b"PQST")?;
+    let version = c.header_versions(b"PQST", 1, 2)?;
     let n_ids = c.be(2)? as usize;
     if n_ids > MAX_IDENTITIES {
         return fail("DECODE", "too many identities");
@@ -302,23 +414,56 @@ pub fn verify_transcript(
     for _ in 0..n_ids {
         ids.push(parse_ident(item(&mut c)?)?);
     }
+    let mut grants = Vec::new();
+    if version == 2 {
+        let n_grants = c.be(2)? as usize;
+        if n_grants > MAX_GRANTS {
+            return fail("DECODE", "too many grants");
+        }
+        let mut seen = HashSet::new();
+        for _ in 0..n_grants {
+            let g = grant::parse_grant(item(&mut c)?)?;
+            if !seen.insert(g.id) {
+                return fail("DECODE", "duplicate grant");
+            }
+            grants.push(g);
+        }
+    }
     let n_entries = c.be(4)? as usize;
     if n_entries > MAX_ENTRIES {
         return fail("DECODE", "too many entries");
     }
     let mut entries = Vec::new();
     for _ in 0..n_entries {
-        entries.push(parse_entry(item(&mut c)?)?);
+        entries.push(parse_entry(item(&mut c)?, version == 2)?);
     }
     c.end()?;
-    let Some(window) = entries.get(from..) else {
+    if version == 2 && grants.is_empty() && entries.iter().all(|e| e.version == 1) {
+        return fail("DECODE", "non-canonical v2 transcript (encode as v1)");
+    }
+    Ok(Decoded {
+        ids,
+        grants,
+        entries,
+    })
+}
+
+/// v1 trace verification (DESIGN §3) over a decoded transcript.
+pub(crate) fn verify_decoded<'a>(
+    root_pk: &[u8],
+    d: &'a Decoded<'a>,
+    from: usize,
+    anchor: Anchor,
+    expected_head: Option<H32>,
+) -> Result<(Report, Parsed<'a>), Failure> {
+    let Some(window) = d.entries.get(from..) else {
         return fail("DECODE", "from beyond end");
     };
 
     // 2. Identities.
     let root_id = hd(D_AGENT_ID, root_pk);
     let mut known: HashMap<H32, &Ident<'_>> = HashMap::new();
-    for d in &ids {
+    for d in &d.ids {
         if !ct(&d.issuer, &root_id) {
             return fail(
                 "IDENTITY_INVALID",
@@ -368,7 +513,12 @@ pub fn verify_transcript(
                 format!("entry {i}: {}", hex::encode(e.sender)),
             );
         };
-        if !mldsa_verify(d.pk, e.body, CTX_MANIFEST, e.sig) {
+        let ctx = if e.version == 1 {
+            CTX_MANIFEST
+        } else {
+            CTX_MANIFEST_V2
+        };
+        if !mldsa_verify(d.pk, e.body, ctx, e.sig) {
             return fail("BAD_SIGNATURE", format!("entry {i}"));
         }
         if e.ts < d.nb || e.ts > d.na {
@@ -390,7 +540,40 @@ pub fn verify_transcript(
             return fail("HEAD_MISMATCH", "head differs from expected");
         }
     }
-    Ok(rep)
+    let grants = d.grants.iter().map(|g| (g.id, g)).collect();
+    Ok((
+        rep,
+        Parsed {
+            idents: known,
+            grants,
+            window,
+        },
+    ))
+}
+
+pub(crate) fn check_root_len(root_pk: &[u8]) -> Result<(), Failure> {
+    if root_pk.len() != PK_LEN {
+        return fail("DECODE", "root public key length");
+    }
+    Ok(())
+}
+
+/// Verify transcript bytes (v1 or v2 container) against `root_pk` (raw 1952
+/// bytes). Only the v1 trace checks run (v2 manifests use the v2 context);
+/// v2 authorization is checked by [`audit_transcript`].
+///
+/// # Errors
+/// The first failure, with a code matching `pqsub-core`.
+pub fn verify_transcript(
+    root_pk: &[u8],
+    transcript: &[u8],
+    from: usize,
+    anchor: Anchor,
+    expected_head: Option<H32>,
+) -> Result<Report, Failure> {
+    check_root_len(root_pk)?;
+    let d = decode_transcript(transcript)?;
+    verify_decoded(root_pk, &d, from, anchor, expected_head).map(|(r, _)| r)
 }
 
 /// Parse an anchor string: `genesis`, `none`, or 64 hex chars.
@@ -419,4 +602,13 @@ pub fn parse_h32(h: &str) -> Result<H32, Failure> {
     }
 }
 
+pub mod audit;
+pub mod caveat;
+pub mod cjson;
+pub(crate) mod grant;
 pub mod vectors;
+pub mod vectors_v2;
+
+pub use audit::{audit_transcript, AuditReport, Finding};
+pub use caveat::caveat_eval;
+pub use cjson::cjson_valid;

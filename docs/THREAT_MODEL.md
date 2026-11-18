@@ -83,3 +83,21 @@ The adversary controls every channel and every storage location. They can read, 
   Allocation is incremental, but a 2^20-entry transcript is still about 3.6 GB. Callers should bound input size before decoding.
 - **Key store race.** `FileKeyStore::save` re-checks for an existing file before renaming, which narrows but does not eliminate a race with a concurrent writer.
 - No formal verification was done; that is out of scope.
+
+## v2: delegated authority (P1)
+
+v2 adds grants, tool calls checked by a gate, receipts and an audit. The full trust boundary, assumptions A1–A3, the exact claim and its limits are in [V2_DESIGN.md §1 and §13](V2_DESIGN.md).
+
+**New trusted components.** The executor and its gate are part of the trusted computing base:
+- A malicious executor can lie in its receipts.
+- An executor that runs a call anyway is caught by the audit as `EXECUTED_UNAUTHORIZED`, but only after the fact.
+- Tool credentials must exist only inside the executor.
+
+**Time.** Authorization is checked against the executor's clock: live, and through the receipt timestamp during audit. The caller's timestamp is never used. This fixes the v1 backdating issue for tool calls. It does not fix it for plain v1 handoffs.
+
+**Grant scope.** Grants bound authority; they do not make agent behaviour correct. An injected agent can still do anything its grant permits, so tight caveats and task-scoped grants are the defence.
+
+**Open issues:**
+- revocation (planned for P4 via a transparency log)
+- expiry of an issuer identity does not invalidate the grants it issued
+- budgets are sound only with one gate per executor role

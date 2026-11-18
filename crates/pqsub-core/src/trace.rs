@@ -6,6 +6,9 @@
 //! | u16 n_identities (0..=1024) | { u32 len (1..=16384) | identity_document }*
 //! | u32 n_entries (0..=1048576) | { u32 len (1..=16384) | signed_manifest }*
 //! ```
+//! v2 (`"PQST" | 0x02`) inserts `u16 n_grants (0..=4096) | { u32 len | grant }*`
+//! after the identities and may mix v1/v2 manifests. A transcript is v2 iff it
+//! has grants or any v2 manifest (anything else is non-canonical).
 //! The trust anchor (root public key) is deliberately **not** part of the
 //! transcript: verifiers must obtain it out of band.
 
@@ -13,19 +16,21 @@ use std::collections::HashMap;
 
 use crate::codec::{Reader, Writer};
 use crate::error::{Error, Result};
+use crate::grant::Grant;
 use crate::hash::{AgentId, Hash32};
 use crate::identity::IdentityDocument;
 use crate::keys::{AgentKeypair, PublicKey, SigningMode};
-use crate::manifest::{ManifestBody, ManifestKind, Recipient, SignedManifest, CTX_MANIFEST};
+use crate::manifest::{Ext, ManifestBody, ManifestKind, Recipient, SignedManifest};
 
 const MAGIC: &[u8; 4] = b"PQST";
-const VERSION: u8 = 1;
 /// Max identity documents per transcript.
 pub const MAX_IDENTITIES: usize = 1024;
 /// Max entries per transcript.
 pub const MAX_ENTRIES: usize = 1 << 20;
 /// Max encoded size of a single identity document or manifest.
 pub const MAX_ITEM_LEN: usize = 16 * 1024;
+/// Max grants per transcript (v2).
+pub const MAX_GRANTS: usize = 4096;
 
 /// What the first verified entry's `prev` must equal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,10 +139,7 @@ pub fn verify_entries(
             index,
             sender: b.sender,
         })?;
-        if !doc
-            .public_key()
-            .verify(e.body_bytes(), CTX_MANIFEST, &e.signature()[..])
-        {
+        if !e.signature_valid_under(doc.public_key()) {
             return Err(Error::BadSignature { index });
         }
         if !doc.is_valid_at(b.timestamp_ms) {
@@ -179,6 +181,8 @@ pub fn verify_entries(
 pub struct Transcript {
     /// Identity documents for every sender.
     pub identities: Vec<IdentityDocument>,
+    /// Delegation grants referenced by tool calls (v2).
+    pub grants: Vec<Grant>,
     /// Trace entries in order.
     pub entries: Vec<SignedManifest>,
 }
@@ -195,12 +199,22 @@ impl Transcript {
         if self.entries.len() > MAX_ENTRIES {
             return Err(Error::InvalidField("too many entries"));
         }
+        if self.grants.len() > MAX_GRANTS {
+            return Err(Error::InvalidField("too many grants"));
+        }
+        let v2 = self.is_v2();
         let mut w = Writer::new();
         w.bytes(MAGIC);
-        w.u8(VERSION);
+        w.u8(if v2 { 2 } else { 1 });
         w.u16(self.identities.len() as u16);
         for d in &self.identities {
             put_item(&mut w, &d.encode())?;
+        }
+        if v2 {
+            w.u16(self.grants.len() as u16);
+            for g in &self.grants {
+                put_item(&mut w, &g.encode())?;
+            }
         }
         w.u32(self.entries.len() as u32);
         for e in &self.entries {
@@ -215,7 +229,13 @@ impl Transcript {
     /// [`Error::Decode`].
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
-        r.magic(MAGIC, VERSION)?;
+        if &r.array::<4>()? != MAGIC {
+            return Err(Error::Decode("bad magic"));
+        }
+        let version = r.u8()?;
+        if version != 1 && version != 2 {
+            return Err(Error::Decode("unsupported version"));
+        }
         let n_ids = r.u16()? as usize;
         if n_ids > MAX_IDENTITIES {
             return Err(Error::Decode("too many identities"));
@@ -223,6 +243,20 @@ impl Transcript {
         let mut identities = Vec::new();
         for _ in 0..n_ids {
             identities.push(IdentityDocument::decode(get_item(&mut r)?)?);
+        }
+        let mut grants: Vec<Grant> = Vec::new();
+        if version == 2 {
+            let n = r.u16()? as usize;
+            if n > MAX_GRANTS {
+                return Err(Error::Decode("too many grants"));
+            }
+            for _ in 0..n {
+                let g = Grant::decode(get_item(&mut r)?)?;
+                if grants.iter().any(|x| x.id() == g.id()) {
+                    return Err(Error::Decode("duplicate grant"));
+                }
+                grants.push(g);
+            }
         }
         let n_entries = r.u32()? as usize;
         if n_entries > MAX_ENTRIES {
@@ -233,10 +267,21 @@ impl Transcript {
             entries.push(SignedManifest::decode(get_item(&mut r)?)?);
         }
         r.finish()?;
-        Ok(Self {
+        let t = Self {
             identities,
+            grants,
             entries,
-        })
+        };
+        if (version == 2) != t.is_v2() {
+            return Err(Error::Decode("non-canonical transcript version"));
+        }
+        Ok(t)
+    }
+
+    /// Whether this transcript must be encoded as v2 (has grants or any v2 manifest).
+    #[must_use]
+    pub fn is_v2(&self) -> bool {
+        !self.grants.is_empty() || self.entries.iter().any(|e| e.body().version() == 2)
     }
 
     /// Verify the whole transcript (or the window `entries[from..]`).
@@ -329,6 +374,20 @@ impl TraceBuilder {
         spec: EntrySpec,
         mode: SigningMode,
     ) -> Result<&SignedManifest> {
+        self.append_ext(key, spec, Ext::V1, mode)
+    }
+
+    /// Sign and append an entry with an explicit version extension (v2 kinds).
+    ///
+    /// # Errors
+    /// Encoding or signing errors.
+    pub fn append_ext(
+        &mut self,
+        key: &AgentKeypair,
+        spec: EntrySpec,
+        ext: Ext,
+        mode: SigningMode,
+    ) -> Result<&SignedManifest> {
         let sender = key.agent_id();
         let seq = self.next_seq.get(&sender).copied().unwrap_or(0);
         let body = ManifestBody {
@@ -340,6 +399,7 @@ impl TraceBuilder {
             prev: self.head,
             intent: spec.intent,
             payload_hash: spec.payload_hash,
+            ext,
         };
         let m = SignedManifest::sign(body, key, mode)?;
         self.head = m.entry_hash();

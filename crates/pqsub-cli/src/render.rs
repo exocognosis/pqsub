@@ -52,6 +52,8 @@ pub fn transcript_text(t: &Transcript, from: usize, report: Option<&TraceReport>
             ManifestKind::Handoff => "HANDOFF ",
             ManifestKind::ToolAuthorization => "TOOL-AUTH",
             ManifestKind::ActionRecord => "ACTION  ",
+            ManifestKind::ToolCall => "TOOL-CALL",
+            ManifestKind::Receipt => "RECEIPT ",
         };
         let _ = writeln!(
             s,

@@ -11,7 +11,7 @@
 crates/pqsub-core     library: keys · identity docs · manifests · traces · key store      (RustCrypto ml-dsa)
 crates/pqsub-cli      `pqsub` CLI · 4-agent simulation · vector generator · benchmarks
 crates/pqsub-verify   independent verifier lib + `pqsub-verify` bin, from spec, no shared code (fips204)
-test-vectors/         vectors.json: 25 transcript cases + keygen/signature vectors
+test-vectors/         vectors.json (v1: 25 transcript cases + keygen/signature) · vectors-v2.json (48 cjson, 62 caveat, 25 audit cases)
 examples/demo/        deterministic demo transcript (binary + text) and its inputs
 ```
 
@@ -35,7 +35,7 @@ cargo test --workspace --locked
 cargo clippy --workspace --all-targets --locked
 ```
 
-The full test suite takes about 50 s on the development machine (MacBook Air, Apple M3, 16 GB). Most of that time goes to the exhaustive cross-implementation bit-flip test. Dependencies are built with `opt-level=3` even in the test profile, because unoptimized ML-DSA is much slower.
+The full test suite takes about 90 s on the development machine (MacBook Air, Apple M3, 16 GB). Most of that time goes to the exhaustive cross-implementation bit-flip test. Dependencies are built with `opt-level=3` even in the test profile, because unoptimized ML-DSA is much slower.
 
 ## Demo: four-agent handoff with a verifiable transcript
 
@@ -130,14 +130,66 @@ The following are **not** provided:
 - keys encrypted at rest
 - a guarantee that a signed intent is *safe* (signed text is still untrusted LLM input)
 
+## v2 (phase P1): bounded, auditable agent authority
+
+The full spec is in [docs/V2_DESIGN.md](docs/V2_DESIGN.md); its §14 is normative.
+
+v1 proves **who said what**. v2 adds **who was allowed to do it** and **what actually executed**:
+
+- **Grants.** These are signed delegation tokens. The root key, kept offline, issues one broad grant to a principal. The principal issues short-lived grants per task, and every further delegation can only narrow authority.
+- **Caveats.** A grant restricts what its holder can do using a small fixed set of caveats:
+  - a tool allow-list
+  - equal-to and one-of checks on arguments
+  - integer ranges
+  - boundary-aware matchers for file paths, URL origins and email domains
+  - call budgets
+  - executor roles
+
+  Any caveat whose argument is missing fails.
+- **Tool calls.** Each tool call carries its arguments in a canonical JSON form, along with its chain of grants.
+- **The gate.** It runs inside the tool executor and decides before anything runs, using the executor's own clock and counters. It signs a **receipt** either way: executed, or refused with a reason.
+- **`pqsub audit` and `pqsub-verify audit`.** These verify integrity, then re-check every executed call at the time on its receipt. They report:
+  - `BLOCKED`
+  - `EXECUTED_UNAUTHORIZED`
+  - `NO_RECEIPT`
+
+  With `--require-authorized`, the audit exits with status 2 if any executed call was unauthorized.
+
+```bash
+pqsub audit --root root.pub transcript.pqst --require-authorized
+pqsub-verify audit --root root.pub transcript.pqst --require-authorized   # independent implementation
+pqsub-verify vectors-v2 test-vectors/vectors-v2.json
+```
+
+**Claim.** If tools can only be reached through executors that run the gate, then a prompt-injected agent cannot cause a side effect outside the authority delegated to it for the task. A third party can verify this from the transcript.
+
+**What v2 does not cover:**
+- harmful actions that stay *within* the granted authority
+- information-flow control
+- confidentiality
+- revocation
+- policy quality: a grant is only as good as its caveats
+
+See V2_DESIGN §1 and §13.
+
+**How independence was established, and its limits.** A separate agent built the v2 verifier from the spec alone and reports that it never read the core code. That agent was another instance of the same model, working from a spec written by the author of the core. Independence therefore lowers the risk of implementation bugs, but it does not rule out a misreading of the spec that both share. On first contact, the two implementations agreed on all 149 v2 vector checks. Differential tests then compared both implementations' error codes and exact audit findings:
+- every bit flip in a grant body (2,304 flips, all detected)
+- strided bit flips and random mutations of a full audit transcript
+- every window offset of every vector
+- 120k fuzzed canonical-JSON checks
+- 20k fuzzed caveat checks
+
 ## Evidence
 
 | Check | Result |
 |---|---|
-| `pqsub-core` unit and integration tests | 25 pass. Includes an exhaustive single-bit flip over all ≈ 28k bits of a manifest, and tamper/reorder/drop/truncate/replay/expiry/identity cases |
-| Cross-implementation tests | 5 pass:<br>• the two implementations give byte-identical keygen and signatures<br>• ≈ 29k bit flips get identical error codes from both<br>• 400 random mutations agree |
-| CLI end-to-end and reproducibility | 5 pass:<br>• the committed vectors match regeneration<br>• the demo transcript is byte-reproducible<br>• the full CLI workflow passes, including tamper, wrong root and payload mismatch |
-| `pqsub-verify vectors test-vectors/vectors.json` | `ALL VECTORS PASS (37 checks)` |
+| `pqsub-core` v1 tests | 25 pass. Includes an exhaustive single-bit flip over all ≈ 28k bits of a manifest, and tamper/reorder/drop/truncate/replay/expiry/identity cases |
+| `pqsub-core` v2 tests | 9 pass: canonical JSON, matcher bypass attempts, grant attenuation and chain rules, gate decisions, audit findings, v2 canonical rules |
+| Cross-implementation, v1 | 5 pass:<br>• byte-identical keygen and signatures<br>• ≈ 29k bit flips get identical error codes from both<br>• 400 random mutations agree |
+| Cross-implementation, v2 | 6 pass:<br>• all 2,304 bit flips of a grant body detected, with identical outcomes<br>• strided flips and mutations of a full audit transcript<br>• every window offset of every vector<br>• 120k fuzzed cjson and 20k fuzzed caveat checks<br>• `pqsub-verify audit` binary output matches the core library |
+| `pqsub-verify` v2 unit tests | 16 pass |
+| CLI end-to-end and reproducibility | 7 pass:<br>• committed v1 and v2 vectors match regeneration<br>• the demo transcript is byte-reproducible<br>• the full CLI workflow passes, including tamper, wrong root and payload mismatch<br>• `pqsub audit` binary output matches the independent library |
+| `pqsub-verify vectors` / `vectors-v2` | `ALL VECTORS PASS` (37 v1 checks, 149 v2 checks) |
 
 Benchmarks, measured with `./target/release/pqsub bench --iters 300` on the development machine, a MacBook Air with an Apple M3 and 16 GB. They have **not** yet been measured on an M4; run the same command there to get M4 numbers:
 

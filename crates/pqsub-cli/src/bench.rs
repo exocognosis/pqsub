@@ -46,6 +46,7 @@ pub fn run(iters: u32) -> Result<String> {
         prev: pqsub_core::Hash32::ZERO,
         intent: "review the patch and report findings".into(),
         payload_hash: Some(pqsub_core::payload_hash(b"x")),
+        ext: pqsub_core::Ext::V1,
     };
     let body_bytes = body.encode()?;
 
@@ -125,6 +126,7 @@ pub fn run(iters: u32) -> Result<String> {
     }
     let t = Transcript {
         identities: ids,
+        grants: vec![],
         entries: tb.into_entries(),
     };
     let tenc = t.encode()?;

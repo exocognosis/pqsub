@@ -156,6 +156,7 @@ pub fn run(deterministic: bool) -> Result<SimRun> {
     }
     let transcript = Transcript {
         identities: ids,
+        grants: vec![],
         entries: tb.into_entries(),
     };
     let checkpoint = transcript.entries[2].entry_hash();

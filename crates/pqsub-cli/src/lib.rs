@@ -7,3 +7,4 @@ pub mod bench;
 pub mod render;
 pub mod sim;
 pub mod vectors;
+pub mod vectors_v2;

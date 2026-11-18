@@ -60,6 +60,7 @@ fn small_transcript(n_entries: u64) -> (AgentKeypair, Vec<u8>) {
     }
     let t = Transcript {
         identities: vec![id],
+        grants: vec![],
         entries: tb.into_entries(),
     };
     (root, t.encode().unwrap())

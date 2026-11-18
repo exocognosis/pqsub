@@ -1,30 +1,36 @@
-//! Signed handoff / tool-authorization / action manifests.
+//! Signed handoff / tool-authorization / action / tool-call / receipt manifests.
 //!
-//! Wire format (v1, big-endian):
+//! v1 wire format (big-endian):
 //! ```text
-//! body = "PQSM" | 0x01 | kind u8 (1=handoff, 2=tool-authorization, 3=action-record)
-//!      | sender[32]
-//!      | recipient: 0x01 | agent_id[32]
-//!      |          | 0x02 | u8 len | role (utf-8, 1..=64)
+//! body = "PQSM" | ver u8 | kind u8 | sender[32]
+//!      | recipient: 0x01 | agent_id[32]  |  0x02 | u8 len | role (utf-8, 1..=64)
 //!      | seq u64 | timestamp_ms u64 | prev[32]
 //!      | u16 len | intent (utf-8, 1..=1024)
 //!      | payload: 0x00 | 0x01 | payload_hash[32]
-//! manifest = body | signature[3309]   ML-DSA-65, ctx = "pqsub/v1/manifest", msg = body
+//!      [v2 only, kind 4] | u8 n tool | u16 n cjson-args | u8 n (1..=8) grant_id[32]*
+//!      [v2 only, kind 5] | call_ref[32] | status u8 | reason u8 | result_hash[32]
+//! manifest = body | signature[3309]
+//!   ctx = "pqsub/v1/manifest" (ver 1) | "pqsub/v2/manifest" (ver 2)
 //! entry_hash = SHA3-256(u8 len(d) | d | body),  d = "pqsub/v1/entry"
 //! ```
 
+use crate::caveat::valid_tool_name;
+use crate::cjson;
 use crate::codec::{check_str, Reader, Writer};
 use crate::error::{Error, Result};
 use crate::hash::{domain_hash, AgentId, Hash32, DOMAIN_ENTRY};
 use crate::identity::{IdentityDocument, MAX_LABEL_LEN};
 use crate::keys::{AgentKeypair, PublicKey, SignatureBytes, SigningMode, SIGNATURE_LEN};
 
-/// ML-DSA context string for manifests.
+/// ML-DSA context string for v1 manifests.
 pub const CTX_MANIFEST: &[u8] = b"pqsub/v1/manifest";
+/// ML-DSA context string for v2 manifests.
+pub const CTX_MANIFEST_V2: &[u8] = b"pqsub/v2/manifest";
 const MAGIC: &[u8; 4] = b"PQSM";
-const VERSION: u8 = 1;
 /// Max byte length of the intent summary.
 pub const MAX_INTENT_LEN: usize = 1024;
+/// Max grants in a tool call's authority chain.
+pub const MAX_CHAIN: usize = 8;
 
 /// What a manifest represents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,18 +38,24 @@ pub const MAX_INTENT_LEN: usize = 1024;
 pub enum ManifestKind {
     /// Delegation of a task to another agent.
     Handoff = 1,
-    /// Authorization for a tool call / side-effecting action.
+    /// Authorization for a tool call / side-effecting action (v1 style, unenforced).
     ToolAuthorization = 2,
     /// Record of an action the sender performed.
     ActionRecord = 3,
+    /// v2: a structured tool call carrying its authority chain.
+    ToolCall = 4,
+    /// v2: an executor-signed receipt for a tool call.
+    Receipt = 5,
 }
 
 impl ManifestKind {
-    fn from_u8(v: u8) -> Result<Self> {
-        match v {
-            1 => Ok(Self::Handoff),
-            2 => Ok(Self::ToolAuthorization),
-            3 => Ok(Self::ActionRecord),
+    fn from_u8(v: u8, version: u8) -> Result<Self> {
+        match (v, version) {
+            (1, _) => Ok(Self::Handoff),
+            (2, _) => Ok(Self::ToolAuthorization),
+            (3, _) => Ok(Self::ActionRecord),
+            (4, 2) => Ok(Self::ToolCall),
+            (5, 2) => Ok(Self::Receipt),
             _ => Err(Error::Decode("unknown manifest kind")),
         }
     }
@@ -54,6 +66,8 @@ impl ManifestKind {
             Self::Handoff => "handoff",
             Self::ToolAuthorization => "tool-authorization",
             Self::ActionRecord => "action-record",
+            Self::ToolCall => "tool-call",
+            Self::Receipt => "receipt",
         }
     }
 }
@@ -67,10 +81,59 @@ pub enum Recipient {
     Role(String),
 }
 
+/// A structured tool call (kind 4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCall {
+    /// Tool name (`[a-z0-9_.-]{1,64}`).
+    pub tool: String,
+    /// Canonical cjson arguments (top-level object).
+    pub args: Vec<u8>,
+    /// Grant ids from root grant to leaf grant.
+    pub chain: Vec<Hash32>,
+}
+
+/// Outcome recorded in a receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ReceiptStatus {
+    /// Executed successfully.
+    ExecutedOk = 0,
+    /// Executed; the tool reported an error.
+    ExecutedError = 1,
+    /// Refused by the gate.
+    Refused = 2,
+}
+
+/// An executor receipt (kind 5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Receipt {
+    /// Entry hash of the tool-call entry.
+    pub call_ref: Hash32,
+    /// Outcome.
+    pub status: ReceiptStatus,
+    /// 0 if executed; gate denial number (2..=8) if refused.
+    pub reason: u8,
+    /// Payload hash of the tool result (zero if refused).
+    pub result_hash: Hash32,
+}
+
+/// Format-version-specific extension of a manifest body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Ext {
+    /// v1 manifest (kinds 1–3).
+    V1,
+    /// v2 manifest without extension fields (kinds 1–3).
+    V2,
+    /// v2 tool call (kind 4).
+    ToolCall(ToolCall),
+    /// v2 receipt (kind 5).
+    Receipt(Receipt),
+}
+
 /// The signed content of a manifest.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ManifestBody {
-    /// Manifest kind.
+    /// Manifest kind (must agree with `ext`).
     pub kind: ManifestKind,
     /// Sender agent id (must equal the signer's key id).
     pub sender: AgentId,
@@ -86,18 +149,72 @@ pub struct ManifestBody {
     pub intent: String,
     /// Optional digest of an out-of-band payload (see [`crate::payload_hash`]).
     pub payload_hash: Option<Hash32>,
+    /// Version / kind-specific fields.
+    pub ext: Ext,
+}
+
+fn validate_ext(kind: ManifestKind, ext: &Ext) -> core::result::Result<(), &'static str> {
+    let basic = matches!(
+        kind,
+        ManifestKind::Handoff | ManifestKind::ToolAuthorization | ManifestKind::ActionRecord
+    );
+    match ext {
+        Ext::V1 | Ext::V2 if basic => Ok(()),
+        Ext::ToolCall(c) if kind == ManifestKind::ToolCall => {
+            if !valid_tool_name(&c.tool) {
+                return Err("tool name");
+            }
+            if !(1..=MAX_CHAIN).contains(&c.chain.len()) {
+                return Err("grant chain length");
+            }
+            cjson::parse_canonical(&c.args, true)
+                .map(|_| ())
+                .map_err(|_| "tool args are not canonical cjson")
+        }
+        Ext::Receipt(r) if kind == ManifestKind::Receipt => match r.status {
+            ReceiptStatus::ExecutedOk | ReceiptStatus::ExecutedError if r.reason == 0 => Ok(()),
+            ReceiptStatus::Refused
+                if (2..=8).contains(&r.reason) && r.result_hash == Hash32::ZERO =>
+            {
+                Ok(())
+            }
+            _ => Err("receipt status/reason/result inconsistent"),
+        },
+        _ => Err("manifest kind does not match its extension"),
+    }
 }
 
 impl ManifestBody {
+    /// Wire format version (1 or 2).
+    #[must_use]
+    pub fn version(&self) -> u8 {
+        if self.ext == Ext::V1 {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// ML-DSA context string for this body's version.
+    #[must_use]
+    pub fn ctx(&self) -> &'static [u8] {
+        if self.version() == 1 {
+            CTX_MANIFEST
+        } else {
+            CTX_MANIFEST_V2
+        }
+    }
+
     /// Canonical body encoding.
     ///
     /// # Errors
-    /// [`Error::InvalidField`] if a string is out of range.
+    /// [`Error::InvalidField`] if a field is out of range.
     pub fn encode(&self) -> Result<Vec<u8>> {
         check_str(&self.intent, 1, MAX_INTENT_LEN, "intent length")?;
+        validate_ext(self.kind, &self.ext).map_err(Error::InvalidField)?;
         let mut w = Writer::new();
         w.bytes(MAGIC);
-        w.u8(VERSION);
+        w.u8(self.version());
         w.u8(self.kind as u8);
         w.bytes(&self.sender.0);
         match &self.recipient {
@@ -122,12 +239,36 @@ impl ManifestBody {
                 w.bytes(&h.0);
             }
         }
+        match &self.ext {
+            Ext::V1 | Ext::V2 => {}
+            Ext::ToolCall(c) => {
+                w.str_u8(&c.tool);
+                w.u16(c.args.len() as u16);
+                w.bytes(&c.args);
+                w.u8(c.chain.len() as u8);
+                for g in &c.chain {
+                    w.bytes(&g.0);
+                }
+            }
+            Ext::Receipt(r) => {
+                w.bytes(&r.call_ref.0);
+                w.u8(r.status as u8);
+                w.u8(r.reason);
+                w.bytes(&r.result_hash.0);
+            }
+        }
         Ok(w.into_vec())
     }
 
     fn decode_from(r: &mut Reader<'_>) -> Result<Self> {
-        r.magic(MAGIC, VERSION)?;
-        let kind = ManifestKind::from_u8(r.u8()?)?;
+        if &r.array::<4>()? != MAGIC {
+            return Err(Error::Decode("bad magic"));
+        }
+        let version = r.u8()?;
+        if version != 1 && version != 2 {
+            return Err(Error::Decode("unsupported version"));
+        }
+        let kind = ManifestKind::from_u8(r.u8()?, version)?;
         let sender = AgentId(r.array()?);
         let recipient = match r.u8()? {
             1 => Recipient::Agent(AgentId(r.array()?)),
@@ -143,6 +284,38 @@ impl ManifestBody {
             1 => Some(Hash32(r.array()?)),
             _ => return Err(Error::Decode("invalid payload flag")),
         };
+        let ext = match (version, kind) {
+            (1, _) => Ext::V1,
+            (_, ManifestKind::ToolCall) => {
+                let tool = r.str_u8(1, 64)?;
+                let n = r.u16()? as usize;
+                let args = r.take(n)?.to_vec();
+                let k = r.u8()? as usize;
+                let chain = (0..k)
+                    .map(|_| r.array().map(Hash32))
+                    .collect::<Result<Vec<_>>>()?;
+                Ext::ToolCall(ToolCall { tool, args, chain })
+            }
+            (_, ManifestKind::Receipt) => {
+                let call_ref = Hash32(r.array()?);
+                let status = match r.u8()? {
+                    0 => ReceiptStatus::ExecutedOk,
+                    1 => ReceiptStatus::ExecutedError,
+                    2 => ReceiptStatus::Refused,
+                    _ => return Err(Error::Decode("receipt status")),
+                };
+                let reason = r.u8()?;
+                let result_hash = Hash32(r.array()?);
+                Ext::Receipt(Receipt {
+                    call_ref,
+                    status,
+                    reason,
+                    result_hash,
+                })
+            }
+            _ => Ext::V2,
+        };
+        validate_ext(kind, &ext).map_err(Error::Decode)?;
         Ok(Self {
             kind,
             sender,
@@ -152,6 +325,7 @@ impl ManifestBody {
             prev,
             intent,
             payload_hash,
+            ext,
         })
     }
 }
@@ -175,7 +349,7 @@ impl SignedManifest {
             return Err(Error::SenderMismatch);
         }
         let body_bytes = body.encode()?;
-        let signature = key.sign(&body_bytes, CTX_MANIFEST, mode)?;
+        let signature = key.sign(&body_bytes, body.ctx(), mode)?;
         Ok(Self {
             body,
             body_bytes,
@@ -218,16 +392,21 @@ impl SignedManifest {
     /// (which must be the sender's key).
     ///
     /// # Errors
-    /// [`Error::SenderMismatch`] if `pk` is not the sender's key,
-    /// [`Error::BadSignature`] (index 0) if the signature is invalid.
+    /// [`Error::SenderMismatch`] or [`Error::BadSignature`] (index 0).
     pub fn verify_signature(&self, pk: &PublicKey) -> Result<()> {
         if !self.body.sender.ct_eq(&pk.agent_id()) {
             return Err(Error::SenderMismatch);
         }
-        if !pk.verify(&self.body_bytes, CTX_MANIFEST, &self.signature[..]) {
+        if !self.signature_valid_under(pk) {
             return Err(Error::BadSignature { index: 0 });
         }
         Ok(())
+    }
+
+    /// Raw signature check under `pk` with the version-appropriate context.
+    #[must_use]
+    pub fn signature_valid_under(&self, pk: &PublicKey) -> bool {
+        pk.verify(&self.body_bytes, self.body.ctx(), &self.signature[..])
     }
 
     /// `H("pqsub/v1/entry", body)`: the value the next trace entry puts in `prev`.
@@ -250,6 +429,22 @@ impl SignedManifest {
     #[must_use]
     pub fn signature(&self) -> &[u8; SIGNATURE_LEN] {
         &self.signature
+    }
+    /// Tool call fields, if kind 4.
+    #[must_use]
+    pub fn tool_call(&self) -> Option<&ToolCall> {
+        match &self.body.ext {
+            Ext::ToolCall(c) => Some(c),
+            _ => None,
+        }
+    }
+    /// Receipt fields, if kind 5.
+    #[must_use]
+    pub fn receipt(&self) -> Option<&Receipt> {
+        match &self.body.ext {
+            Ext::Receipt(r) => Some(r),
+            _ => None,
+        }
     }
 }
 
@@ -274,10 +469,7 @@ pub fn verify_handoff(
             sender: m.body.sender,
         });
     }
-    if !identity
-        .public_key()
-        .verify(&m.body_bytes, CTX_MANIFEST, &m.signature[..])
-    {
+    if !m.signature_valid_under(identity.public_key()) {
         return Err(Error::BadSignature { index: 0 });
     }
     if !identity.is_valid_at(m.body.timestamp_ms) {

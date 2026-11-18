@@ -32,6 +32,7 @@ fn body(sender: &AgentKeypair, seq: u64) -> ManifestBody {
         prev: Hash32::ZERO,
         intent: "review patch #7".into(),
         payload_hash: Some(payload_hash(b"diff --git a b")),
+        ext: Ext::V1,
     }
 }
 
@@ -278,8 +279,17 @@ fn manifest_rejects_noncanonical_encodings() {
     t[5] = 9; // kind
     assert_eq!(SignedManifest::decode(&t).unwrap_err().code(), "DECODE");
     let mut t = enc.clone();
-    t[4] = 2; // version
+    t[4] = 3; // unknown version
     assert_eq!(SignedManifest::decode(&t).unwrap_err().code(), "DECODE");
+    // Version byte 1 -> 2 yields a well-formed v2 manifest, but the v2 context
+    // makes the original signature invalid.
+    let mut t = enc.clone();
+    t[4] = 2;
+    let m2 = SignedManifest::decode(&t).unwrap();
+    assert_eq!(
+        m2.verify_signature(a.public_key()).unwrap_err().code(),
+        "BAD_SIGNATURE"
+    );
     // payload flag: located right before the 32-byte payload hash + signature.
     let flag_pos = enc.len() - SIGNATURE_LEN - 33;
     assert_eq!(enc[flag_pos], 1);
@@ -503,6 +513,7 @@ fn transcript_roundtrip_and_bit_flips() {
     let f = fixture();
     let t = Transcript {
         identities: f.ids.clone(),
+        grants: vec![],
         entries: f.entries.clone(),
     };
     let enc = t.encode().unwrap();

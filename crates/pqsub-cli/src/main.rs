@@ -151,6 +151,21 @@ enum Cmd {
         #[arg(long)]
         show: bool,
     },
+    /// Audit a v2 transcript: integrity + authorization of every executed tool call.
+    Audit {
+        #[arg(long)]
+        root: PathBuf,
+        transcript: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        from: usize,
+        #[arg(long)]
+        anchor: Option<String>,
+        #[arg(long)]
+        expect_head: Option<String>,
+        /// Exit 2 if any executed call was unauthorized.
+        #[arg(long)]
+        require_authorized: bool,
+    },
     /// Print any pqsub artifact in human-readable form (does not verify).
     Inspect { file: PathBuf },
     /// Print the payload digest of a file.
@@ -167,6 +182,8 @@ enum Cmd {
     GenVectors {
         #[arg(long, default_value = "test-vectors/vectors.json")]
         out: PathBuf,
+        #[arg(long, default_value = "test-vectors/vectors-v2.json")]
+        out_v2: PathBuf,
     },
     /// Micro-benchmarks (use --release).
     Bench {
@@ -240,6 +257,7 @@ fn inspect(bytes: &[u8]) -> Result<String> {
         b"PQSM" => {
             let t = Transcript {
                 identities: vec![],
+                grants: vec![],
                 entries: vec![SignedManifest::decode(bytes)?],
             };
             render::transcript_text(&t, 0, None)
@@ -342,6 +360,7 @@ fn run(cli: Cli) -> Result<()> {
                     .unwrap_or_default(),
                 intent: s.intent,
                 payload_hash: s.payload_hash,
+                ext: pqsub_core::Ext::V1,
             };
             let m = SignedManifest::sign(body, &k, SigningMode::Hedged)?;
             let enc = m.encode();
@@ -458,6 +477,71 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Cmd::Audit {
+            root,
+            transcript,
+            from,
+            anchor,
+            expect_head,
+            require_authorized,
+        } => {
+            let root = load_root(&root)?;
+            let t = Transcript::decode(&read(&transcript)?)?;
+            let opts = VerifyOptions {
+                anchor: parse_anchor(anchor.as_deref(), from)?,
+                expected_head: expect_head.as_deref().map(Hash32::from_hex).transpose()?,
+            };
+            match pqsub_core::audit(&root, &t, from, &opts) {
+                Ok(r) => {
+                    println!(
+                        "INTEGRITY OK  {} entries  anchored={}  head={}",
+                        r.trace.entries.len(),
+                        r.trace.anchored,
+                        r.trace.head
+                    );
+                    for f in &r.findings {
+                        println!(
+                            "{:<22} entry #{:<3} call #{:<3} reason={}{}",
+                            f.code,
+                            from + f.index,
+                            from + f.call_index,
+                            f.reason,
+                            if f.code == "BLOCKED" {
+                                format!(" justified={}", f.justified)
+                            } else {
+                                String::new()
+                            }
+                        );
+                    }
+                    let window = t.entries.get(from..).unwrap_or_default();
+                    let count = |k: pqsub_core::ManifestKind| {
+                        window.iter().filter(|e| e.body().kind == k).count()
+                    };
+                    let calls = count(pqsub_core::ManifestKind::ToolCall);
+                    let receipts = count(pqsub_core::ManifestKind::Receipt);
+                    println!(
+                        "{calls} tool calls, {receipts} receipts, {} findings",
+                        r.findings.len()
+                    );
+                    if calls == 0 {
+                        println!("NO TOOL CALLS  nothing to authorize in this window");
+                    } else if r.all_executed_authorized() {
+                        println!(
+                            "AUTHORIZED  every executed tool call was authorized at execution time"
+                        );
+                    } else {
+                        println!("UNAUTHORIZED EXECUTION DETECTED");
+                        if require_authorized {
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("INVALID [{}] {e}", e.code());
+                    std::process::exit(2);
+                }
+            }
+        }
         Cmd::Inspect { file } => print!("{}", inspect(&read(&file)?)?),
         Cmd::Hash { file } => println!("{}", payload_hash(&read(&file)?)),
         Cmd::Simulate { out, deterministic } => {
@@ -466,7 +550,16 @@ fn run(cli: Cli) -> Result<()> {
             println!("checkpoint (hash of entry #2): {}", s.checkpoint);
             println!("artifacts written to {}", out.display());
         }
-        Cmd::GenVectors { out } => {
+        Cmd::GenVectors { out, out_v2 } => {
+            let v2 = pqsub_cli::vectors_v2::generate()?;
+            fs::write(&out_v2, pqsub_cli::vectors_v2::to_json(&v2)?)?;
+            println!(
+                "wrote {} cjson, {} caveat, {} audit cases to {}",
+                v2.cjson.len(),
+                v2.caveats.len(),
+                v2.cases.len(),
+                out_v2.display()
+            );
             let v = vectors::generate()?;
             fs::write(&out, vectors::to_json(&v)?)?;
             println!(

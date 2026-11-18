@@ -72,6 +72,24 @@ pub enum Error {
     /// A key file is readable by group/other, or otherwise unsafe.
     #[error("unsafe key file: {0}")]
     KeyFile(String),
+    /// Audit: a receipt references no earlier tool call in the window.
+    #[error("entry {index}: receipt references no earlier tool call")]
+    ReceiptOrphan {
+        /// Entry index within the verified window.
+        index: usize,
+    },
+    /// Audit: a tool call has more than one receipt.
+    #[error("entry {index}: duplicate receipt for the same tool call")]
+    DuplicateReceipt {
+        /// Entry index within the verified window.
+        index: usize,
+    },
+    /// Audit: the receipt signer is not the call's intended executor.
+    #[error("entry {index}: receipt signed by an agent that is not the call's executor")]
+    ReceiptWrongExecutor {
+        /// Entry index within the verified window.
+        index: usize,
+    },
     /// Underlying I/O failure.
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -96,6 +114,9 @@ impl Error {
             Error::Signing => "SIGNING",
             Error::Rng => "RNG",
             Error::KeyFile(_) => "KEY_FILE",
+            Error::ReceiptOrphan { .. } => "RECEIPT_ORPHAN",
+            Error::DuplicateReceipt { .. } => "DUPLICATE_RECEIPT",
+            Error::ReceiptWrongExecutor { .. } => "RECEIPT_WRONG_EXECUTOR",
             Error::Io(_) => "IO",
         }
     }

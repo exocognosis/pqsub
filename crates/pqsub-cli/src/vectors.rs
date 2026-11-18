@@ -577,6 +577,7 @@ pub fn generate() -> Result<Vectors> {
         prev: head,
         intent: "step 0: do the thing".into(),
         payload_hash: None,
+        ext: pqsub_core::Ext::V1,
     };
     let mut e = en.clone();
     e.push(SignedManifest::sign(replay, &agents[0], DET)?.encode());
