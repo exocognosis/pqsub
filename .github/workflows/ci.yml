@@ -29,6 +29,7 @@ jobs:
       - name: committed demo transcripts verify and audit as documented
         run: |
           cargo run --release --locked --example gated_tool -p pqsub-cli
+          ./examples/demo-banking.sh
           ./target/release/pqsub-verify transcript --root examples/demo/root.pub examples/demo/transcript.pqst --expect-head "$(cat examples/demo/head.txt)"
           ./target/release/pqsub-verify audit --root examples/v2-audit/root.pub examples/v2-audit/honest-executor.pqst --require-authorized
           ! ./target/release/pqsub-verify audit --root examples/v2-audit/root.pub examples/v2-audit/rogue-executor.pqst --require-authorized

