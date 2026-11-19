@@ -89,6 +89,33 @@ cargo test --workspace --locked --release
 
 CI runs all of the above on Linux and macOS on every push.
 
+## Wrap your own tool
+
+[`crates/pqsub-cli/examples/gated_tool.rs`](crates/pqsub-cli/examples/gated_tool.rs) puts a real tool — one that writes files — behind a gate. The agent's grant allows writes only inside a sandbox directory. It asks for one write inside and one that escapes with `../`:
+
+```bash
+cargo run --release --example gated_tool -p pqsub-cli
+```
+
+```text
+$SANDBOX/report.txt        -> ExecutedOk (reason 0)
+$SANDBOX/../pwned.txt      -> Refused (reason 6)
+file outside sandbox exists: false
+audit: BLOCKED entry #3 reason=6 justified=true
+audit: every executed call authorized = true
+```
+
+The tool itself is an ordinary function that knows nothing about pqsub. The integration is one call on the executor side:
+
+```rust
+fn write_file(args: &[u8]) -> Result<Vec<u8>, Vec<u8>> { /* your tool */ }
+
+let receipt = gate.execute(&signed_call, now_ms, write_file)?; // runs the tool only if authorized
+trace.append_ext(gate.key(), receipt_spec, receipt, SigningMode::Hedged)?; // signed receipt either way
+```
+
+The rest of the example is the one-time setup of keys, identities and grants, followed by an audit through the independent verifier. This is a library-level adapter. A drop-in proxy that speaks [MCP](https://modelcontextprotocol.io) is on the roadmap.
+
 ## Why this matters
 
 LLM agents read untrusted text — web pages, emails, documents — and any of it can carry a prompt injection. Filters and better prompts reduce the risk but can't eliminate it. pqsub takes the other route: **assume the agent can be fooled, and make it cryptographically impossible for a fooled agent to exceed its mandate.**

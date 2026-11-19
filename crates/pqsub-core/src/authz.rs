@@ -295,6 +295,47 @@ impl Gate {
         apply(&mut self.counters, bump);
         Ok(())
     }
+
+    /// Check `call`, run `tool(args)` **only if** it is authorized, and return
+    /// the receipt extension to sign into the transcript (kind
+    /// [`ManifestKind::Receipt`], signed with [`Gate::key`]).
+    ///
+    /// `tool` returns `Ok(result)` or `Err(error_result)`; both are hashed into
+    /// the receipt. This is the whole integration surface for wrapping a tool.
+    ///
+    /// # Errors
+    /// `Err(Denial::WrongExecutor)` if the call is addressed to another
+    /// executor: drop it, it gets no receipt. Every other denial is returned as
+    /// an `Ok` refused receipt and the tool is not run.
+    pub fn execute<F>(
+        &mut self,
+        call: &SignedManifest,
+        now_ms: u64,
+        tool: F,
+    ) -> core::result::Result<Ext, Denial>
+    where
+        F: FnOnce(&[u8]) -> core::result::Result<Vec<u8>, Vec<u8>>,
+    {
+        let receipt = |status, reason, result_hash| {
+            Ext::Receipt(Receipt {
+                call_ref: call.entry_hash(),
+                status,
+                reason,
+                result_hash,
+            })
+        };
+        match self.check(call, now_ms) {
+            Err(Denial::WrongExecutor) => Err(Denial::WrongExecutor),
+            Err(d) => Ok(receipt(ReceiptStatus::Refused, d as u8, Hash32::ZERO)),
+            Ok(()) => {
+                let args = call.tool_call().map_or(&[][..], |c| &c.args[..]);
+                Ok(match tool(args) {
+                    Ok(r) => receipt(ReceiptStatus::ExecutedOk, 0, payload_hash(&r)),
+                    Err(r) => receipt(ReceiptStatus::ExecutedError, 0, payload_hash(&r)),
+                })
+            }
+        }
+    }
 }
 
 /// An authorization finding from [`audit`].
