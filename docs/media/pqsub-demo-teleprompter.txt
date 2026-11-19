@@ -1,0 +1,5 @@
+[  3.0s -  15.0s]  Authority is delegated once, then only narrowed.
+[ 15.0s -  31.0s]  A prompt-injected agent asks for a payment outside its grant.
+[ 31.0s -  47.0s]  The executor gate blocks it. The agent never touches the credentials.
+[ 47.0s -  71.0s]  Anyone with the root public key can audit the transcript offline.
+[ 71.0s -  85.0s]  Post-quantum signatures. Attenuated grants. Executor-side enforcement.

@@ -2,7 +2,7 @@
 # One-command pqsub demo: delegate, attack, gate, then audit with the independent verifier.
 #
 #   ./examples/demo-banking.sh [OUT_DIR]
-#   PQSUB_PACE=1 ./examples/demo-banking.sh   # paced for screen recording (~55 s; see scripts/narrate-recording.py)
+#   PQSUB_PACE=1 ./examples/demo-banking.sh   # paced output, for reading along or a manual recording
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT="${1:-demo-banking-out}"

@@ -1,20 +1,20 @@
 1
-00:00:00,000 --> 00:00:12,000
+00:00:03,000 --> 00:00:15,015
 Authority is delegated once, then only narrowed.
 
 2
-00:00:12,000 --> 00:00:28,000
+00:00:15,015 --> 00:00:31,018
 A prompt-injected agent asks for a payment outside its grant.
 
 3
-00:00:28,000 --> 00:00:45,000
+00:00:31,018 --> 00:00:47,011
 The executor gate blocks it. The agent never touches the credentials.
 
 4
-00:00:45,000 --> 00:01:10,000
+00:00:47,011 --> 00:01:11,012
 Anyone with the root public key can audit the transcript offline.
 
 5
-00:01:10,000 --> 00:01:25,000
+00:01:11,012 --> 00:01:25,011
 Post-quantum signatures. Attenuated grants. Executor-side enforcement.
 
