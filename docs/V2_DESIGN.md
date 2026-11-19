@@ -506,3 +506,21 @@ The checks run in this order. The first failure determines the reason number.
      - The issuer identity's own validity window is not checked against `t`. Should an expired identity's grants become unusable?
      - The caller's identity validity is checked only against the caller's asserted timestamp, through the v1 checks.
      - The online gate *does* check the caller's identity at executor time. For a malicious executor, the audit is therefore slightly weaker than the gate.
+
+### 14.13 Grant revocation (v2.1, additive)
+
+Added 2026-11-18. Normative, like the rest of §14. Everything not mentioned here is unchanged; all P1 vectors keep their bytes and outcomes. A P1-only decoder rejects kind 6 and receipt reason 9 with `DECODE`, which is the intended forward behaviour.
+
+**Design constraint.** A revocation takes effect from its **position in the hash-chained transcript**, never from a time the revoker asserts. A revoker therefore cannot backdate a revocation to make an honest executor's earlier receipts look unauthorized.
+
+1. **Manifest kind 6 (revocation).** Allowed only in v2 manifests; v2 manifests now allow kinds 1..=6. The ext appended after the payload field (same position as the kind-4/kind-5 fields) is exactly `target[32]`, a grant id. The recipient field is unconstrained (by convention `Role("*")`). Signed under the v2 ctx `pqsub/v2/manifest`, like any v2 manifest, and subject to all v1 checks (identity, signature, validity window at its own timestamp, seq, chain).
+2. **Receipt reason 9 `GRANT_REVOKED`.** For status 2, reason must now be in 2..=9.
+3. **Effective revocation.** Given a set of accepted revocations, each a pair `(revoker AgentId, target grant id)`, grant `chain[k]` of a call C is *revoked for C* iff some accepted revocation has `target == id(chain[k])` and `revoker == chain[j].issuer` for some `j ≤ k`. That is: the issuer of the grant itself, or the issuer of any ancestor in **that call's** chain, may revoke it. Revoking a grant therefore also invalidates every chain that passes through it. A revocation whose revoker is not entitled for a given chain, or whose target is unknown or not in the chain, has no effect on that call. Duplicate revocations are harmless.
+4. **Check order.** §14.8 gains one step between GRANT_EXPIRED (step 4) and CAVEAT_VIOLATION (step 5):
+   - **4a. (9) GRANT_REVOKED.** For k in chain order, fail if `chain[k]` is revoked for C (item 3).
+   Steps 1–4 still run over the whole chain first (as in §14.12 item 5), so an unknown, badly signed, mis-linked or expired chain reports those reasons, not 9. A refused call never consumes budget.
+5. **Online gate.** The gate keeps a set of accepted revocations. Accepting a revocation requires: kind 6, the sender's identity is in the gate's verified identity map, and the manifest signature verifies under that identity's key. Entitlement is not checked on acceptance; it is evaluated per call by item 3. A revocation is effective for every check after it is accepted.
+6. **Audit.** While walking the window (§14.10 step 2), every kind-6 entry at window index r is added to the accepted set. For a receipt at window index i, §14.8 runs with exactly the revocations at window indices `< i`. This applies to both executed receipts (`EXECUTED_UNAUTHORIZED` with reason 9) and refused receipts (`justified`). Kind-6 entries produce no finding of their own.
+7. **Windows.** Only revocations inside the audited window are known to the audit. A revocation that precedes `from` is not applied; auditors who need it must audit from an earlier anchor.
+8. **New trust assumption A4.** An executor ingests every revocation entry that precedes, in the transcript, any receipt it appends. Under A1–A4 an honest executor never produces `EXECUTED_UNAUTHORIZED` with reason 9; one that ignores a revocation is detected by the audit.
+9. **Out of scope for v2.1.** The root cannot revoke (it is offline and has no transcript identity), so a root grant `g0` can only expire. Agent keys and identity documents cannot be revoked. This is grant revocation recorded in the transcript, not a transparency log (P4).
