@@ -97,7 +97,13 @@ v2 adds grants, tool calls checked by a gate, receipts and an audit. The full tr
 
 **Grant scope.** Grants bound authority; they do not make agent behaviour correct. An injected agent can still do anything its grant permits, so tight caveats and task-scoped grants are the defence.
 
+**Grant revocation (v2.1, V2_DESIGN §14.13).** The issuer of a grant, or of any ancestor grant in a call's chain, can revoke it with a signed kind-6 entry in the transcript. A revocation takes effect from its **position** in the hash chain, not from a timestamp the revoker chooses, so it cannot be backdated to make an honest executor's earlier receipts look unauthorized. This adds assumption **A4**: an executor ingests every revocation entry that precedes, in the transcript, any receipt it appends. An executor that ignores a revocation is reported as `EXECUTED_UNAUTHORIZED` with reason 9 (`GRANT_REVOKED`). Limits:
+- The offline root cannot revoke, so a root grant can only expire.
+- Agent keys and identity documents cannot be revoked; a compromised agent key is still bounded only by expiry (see above). Grant revocation is not key revocation.
+- An audit window only knows revocations inside it; audit from an anchor before the revocation to apply it.
+- Propagating revocations to gates is the deployment's job. A transparency log (P4) would make missed revocations detectable across executors.
+
 **Open issues:**
-- revocation (planned for P4 via a transparency log)
+- key and identity revocation, and a transparency log (P4)
 - expiry of an issuer identity does not invalidate the grants it issued
 - budgets are sound only with one gate per executor role

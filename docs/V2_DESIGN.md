@@ -1,6 +1,6 @@
 # pqsub v2 design: bounded, verifiable agent authority
 
-Status: **P1 implemented** (formats, gate and audit in `pqsub-core`, plus an independent re-implementation in `pqsub-verify`). P2–P5 are not started. All v1 formats and guarantees (`docs/DESIGN.md`) remain valid.
+Status: **P1 implemented, plus v2.1 grant revocation (§14.13)** (formats, gate and audit in `pqsub-core`, plus an independent re-implementation in `pqsub-verify`). P2–P5 are not started. All v1 formats and guarantees (`docs/DESIGN.md`) remain valid.
 
 ## 0. Thesis
 
@@ -263,7 +263,7 @@ With `--require-authorized`, the audit fails if any `EXECUTED_UNAUTHORIZED` find
 | **P1** | Core: grant, canonical JSON, caveats, kind 4/5 manifests, transcript v2, `Gate`, `audit`; parity in `pqsub-verify` | v1 vectors unchanged; new vectors (48 of 135 canonical JSON, plus caveat bypass attempts); both implementations give identical codes on bit flips and mutations |
 | **P2** | `pqsub gate` executor sidecar as an MCP proxy holding tool credentials; mock bank and mail tools; the §8 attack demo | Scripted demo plus end-to-end tests: injection refused, audit passes with `--require-authorized` |
 | **P3** | Evaluation harness (Python agent loop ↔ gate) on an AgentDojo subset | Pre-registered policies; results table; reproducible script |
-| **P4** | Transparency log: Merkle tree, signed tree heads, inclusion and consistency proofs, grant revocation through the log | Proof vectors; detection of equivocation/forks |
+| **P4** | Transparency log: Merkle tree, signed tree heads, inclusion and consistency proofs; key/identity revocation and log-backed propagation of grant revocations (in-transcript grant revocation shipped early as v2.1, §14.13) | Proof vectors; detection of equivocation/forks |
 | **P5** | Technical report, blog post, demo video | — |
 
 ## 12. Open decisions (need approval before P1 code)
@@ -274,7 +274,7 @@ With `--require-authorized`, the audit fails if any `EXECUTED_UNAUTHORIZED` find
 
 ## 13. Known limits of v2
 
-- There is no revocation before P4. Short grant lifetimes are the mitigation.
+- Grant revocation exists since v2.1 (§14.13), recorded positionally in the transcript. Key and identity revocation, root-grant revocation and a transparency log wait for P4; short lifetimes remain the mitigation there.
 - Executors are trusted. A malicious executor can lie in its receipts.
 - Budgets assume a single gate instance per executor role.
 - There is no information-flow control. Read-then-exfiltrate within granted channels is not prevented.
@@ -524,3 +524,11 @@ Added 2026-11-18. Normative, like the rest of §14. Everything not mentioned her
 7. **Windows.** Only revocations inside the audited window are known to the audit. A revocation that precedes `from` is not applied; auditors who need it must audit from an earlier anchor.
 8. **New trust assumption A4.** An executor ingests every revocation entry that precedes, in the transcript, any receipt it appends. Under A1–A4 an honest executor never produces `EXECUTED_UNAUTHORIZED` with reason 9; one that ignores a revocation is detected by the audit.
 9. **Out of scope for v2.1.** The root cannot revoke (it is offline and has no transcript identity), so a root grant `g0` can only expire. Agent keys and identity documents cannot be revoked. This is grant revocation recorded in the transcript, not a transparency log (P4).
+10. **Clarifications confirmed by the independent implementation.** `pqsub-verify` v2.1 was again written by a separate agent from this section alone. Its judgment calls all matched `pqsub-core` and are normative:
+    1. Item 3 applies literally; the root is not special-cased (it can revoke only if some transcript identity had `agent_id == AgentId(root)`, which cannot happen for a well-formed root).
+    2. A revocation's own timestamp never affects when it applies; it still passes the v1 validity-window check at that timestamp.
+    3. Kind 6 accepts either recipient form.
+    4. A kind-6 ext that is not exactly 32 bytes is `DECODE` (truncation or trailing bytes).
+    5. A receipt whose `call_ref` is a kind-6 entry is `RECEIPT_ORPHAN`.
+    6. A v2 container with no grants but containing a kind-6 manifest is canonical (it holds a v2 manifest).
+    7. Reason 9 with status 0 or 1 is `DECODE`, as for every non-zero reason.

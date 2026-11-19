@@ -33,6 +33,8 @@ pub enum Denial {
     BudgetExceeded = 7,
     /// The call itself failed v1 checks at the gate (identity, signature, seq, kind).
     CallInvalid = 8,
+    /// v2.1: a chain grant was revoked by an entitled revoker (§14.13).
+    GrantRevoked = 9,
 }
 
 impl Denial {
@@ -48,6 +50,7 @@ impl Denial {
             Self::CaveatViolation => "CAVEAT_VIOLATION",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::CallInvalid => "CALL_INVALID",
+            Self::GrantRevoked => "GRANT_REVOKED",
         }
     }
 }
@@ -63,6 +66,8 @@ pub struct AuthzContext<'a> {
     pub identities: &'a HashMap<AgentId, &'a IdentityDocument>,
     /// Known grants by id.
     pub grants: &'a HashMap<Hash32, &'a Grant>,
+    /// Accepted revocations as `(revoker, revoked grant id)` (§14.13).
+    pub revocations: &'a [(AgentId, Hash32)],
 }
 
 /// §14.8 authorization check for tool call `call` at time `t`, executed by an
@@ -70,7 +75,7 @@ pub struct AuthzContext<'a> {
 /// to increment.
 ///
 /// # Errors
-/// The first failing [`Denial`] (reasons 2..=7).
+/// The first failing [`Denial`] (reasons 2..=7, 9).
 pub fn check_authorization(
     ctx: &AuthzContext<'_>,
     call: &SignedManifest,
@@ -122,6 +127,15 @@ pub fn check_authorization(
     // (5) windows
     if chain.iter().any(|g| !g.is_valid_at(t)) {
         return Err(Denial::GrantExpired);
+    }
+    // (4a, §14.13) revocation by the grant's issuer or an ancestor's issuer in this chain
+    for (k, g) in chain.iter().enumerate() {
+        let revoked = ctx.revocations.iter().any(|(by, target)| {
+            target.ct_eq(&g.id()) && chain[..=k].iter().any(|a| a.issuer().ct_eq(by))
+        });
+        if revoked {
+            return Err(Denial::GrantRevoked);
+        }
     }
     // (6) caveats
     let args = cjson::parse_canonical(&tc.args, true).map_err(|_| Denial::CallInvalid)?;
@@ -198,6 +212,7 @@ pub struct Gate {
     identities: HashMap<AgentId, IdentityDocument>,
     grants: HashMap<Hash32, Grant>,
     last_seq: HashMap<AgentId, u64>,
+    revocations: Vec<(AgentId, Hash32)>,
     counters: Counters,
 }
 
@@ -233,6 +248,7 @@ impl Gate {
             identities: map,
             grants: HashMap::new(),
             last_seq: HashMap::new(),
+            revocations: Vec::new(),
             counters: Counters::new(),
         })
     }
@@ -240,6 +256,28 @@ impl Gate {
     /// Register a grant (verified lazily when a call references it).
     pub fn add_grant(&mut self, g: Grant) {
         self.grants.insert(g.id(), g);
+    }
+
+    /// Accept a signed revocation (kind 6, §14.13). It takes effect for every
+    /// later check. Whether the revoker is entitled is decided per call.
+    ///
+    /// # Errors
+    /// [`Error::InvalidField`] if `rev` is not a revocation, its sender is not a
+    /// known identity, or its signature does not verify.
+    pub fn add_revocation(&mut self, rev: &SignedManifest) -> Result<()> {
+        let target = rev
+            .revocation()
+            .ok_or(Error::InvalidField("not a revocation"))?;
+        let by = rev.body().sender;
+        let doc = self
+            .identities
+            .get(&by)
+            .ok_or(Error::InvalidField("revoker identity unknown"))?;
+        if !rev.signature_valid_under(doc.public_key()) {
+            return Err(Error::InvalidField("revocation signature invalid"));
+        }
+        self.revocations.push((by, target));
+        Ok(())
     }
 
     /// The executor's signing key (used to sign receipts).
@@ -290,6 +328,7 @@ impl Gate {
             root: &self.root,
             identities: &ids,
             grants: &grants,
+            revocations: &self.revocations,
         };
         let bump = check_authorization(&ctx, call, now_ms, &self.role, &self.counters)?;
         apply(&mut self.counters, bump);
@@ -394,12 +433,7 @@ pub fn audit(
         .map(|d| (d.agent_id(), d))
         .collect();
     let grants: HashMap<Hash32, &Grant> = transcript.grants.iter().map(|g| (g.id(), g)).collect();
-    let ctx = AuthzContext {
-        root,
-        identities: &ids,
-        grants: &grants,
-    };
-
+    let mut revocations: Vec<(AgentId, Hash32)> = Vec::new();
     let mut calls: HashMap<Hash32, usize> = HashMap::new();
     let mut receipted: Vec<bool> = vec![false; window.len()];
     let mut counters = Counters::new();
@@ -408,6 +442,10 @@ pub fn audit(
     for (i, e) in window.iter().enumerate() {
         if e.body().kind == ManifestKind::ToolCall {
             calls.insert(e.entry_hash(), i);
+            continue;
+        }
+        if let Some(target) = e.revocation() {
+            revocations.push((e.body().sender, target));
             continue;
         }
         let Some(r) = e.receipt() else { continue };
@@ -429,6 +467,12 @@ pub fn audit(
         if !ok_exec {
             return Err(Error::ReceiptWrongExecutor { index: i });
         }
+        let ctx = AuthzContext {
+            root,
+            identities: &ids,
+            grants: &grants,
+            revocations: &revocations,
+        };
         let res = check_authorization(
             &ctx,
             call,

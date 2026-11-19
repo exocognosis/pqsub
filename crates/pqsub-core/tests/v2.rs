@@ -842,3 +842,77 @@ fn transcript_v2_canonical_rules_and_tamper() {
         }
     }
 }
+
+fn revoke(tb: &mut TraceBuilder, by: &AgentKeypair, target: Hash32, ts: u64) -> SignedManifest {
+    let spec = EntrySpec {
+        kind: ManifestKind::Revocation,
+        recipient: Recipient::Role("*".into()),
+        intent: "revoke grant".into(),
+        payload_hash: None,
+        timestamp_ms: ts,
+    };
+    tb.append_ext(by, spec, Ext::Revocation(target), DET)
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn gate_honors_revocations_and_execute_skips_the_tool() {
+    let mut w = world();
+    let mut tb = TraceBuilder::new();
+    let t = T0 + MIN;
+    let pay = r#"{"amount":95000,"to":"DE89LANDLORD"}"#;
+    let (g1, g2) = (w.g[1].id(), w.g[2].id());
+
+    // Not a revocation / unknown revoker are rejected on ingest.
+    let c = call(&mut tb, &w.agent, "bank", "send_money", pay, chain(&w), t);
+    assert!(w.bank.add_revocation(&c).is_err());
+    let stranger = kp(250);
+    let mut other = TraceBuilder::new();
+    let r = revoke(&mut other, &stranger, g1, t);
+    assert!(
+        w.bank.add_revocation(&r).is_err(),
+        "revoker identity unknown"
+    );
+
+    // Unentitled revokers (g1's audience, the leaf holder) have no effect.
+    let r = revoke(&mut tb, &w.orch, g1, t);
+    w.bank.add_revocation(&r).unwrap();
+    let r = revoke(&mut tb, &w.agent, g2, t);
+    w.bank.add_revocation(&r).unwrap();
+    let mut ran = 0;
+    let ext = w
+        .bank
+        .execute(&c, t, |_| {
+            ran += 1;
+            Ok(b"tx-1".to_vec())
+        })
+        .unwrap();
+    assert!(matches!(ext, Ext::Receipt(ref r) if r.status == ReceiptStatus::ExecutedOk));
+    assert_eq!(ran, 1);
+
+    // The issuer of g1 revokes it: later calls are refused and the tool never runs.
+    let r = revoke(&mut tb, &w.principal, g1, t);
+    w.bank.add_revocation(&r).unwrap();
+    let c2 = call(
+        &mut tb,
+        &w.agent,
+        "bank",
+        "send_money",
+        pay,
+        chain(&w),
+        t + 1,
+    );
+    let ext = w
+        .bank
+        .execute(&c2, t + 1, |_| {
+            ran += 1;
+            Ok(vec![])
+        })
+        .unwrap();
+    assert!(
+        matches!(ext, Ext::Receipt(ref r) if r.status == ReceiptStatus::Refused && r.reason == Denial::GrantRevoked as u8)
+    );
+    assert_eq!(ran, 1, "a refused call must not run the tool");
+    assert_eq!(Denial::GrantRevoked.code(), "GRANT_REVOKED");
+}

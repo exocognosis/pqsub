@@ -54,6 +54,7 @@ pub fn transcript_text(t: &Transcript, from: usize, report: Option<&TraceReport>
             ManifestKind::ActionRecord => "ACTION  ",
             ManifestKind::ToolCall => "TOOL-CALL",
             ManifestKind::Receipt => "RECEIPT ",
+            ManifestKind::Revocation => "REVOKE  ",
         };
         let _ = writeln!(
             s,
@@ -63,6 +64,9 @@ pub fn transcript_text(t: &Transcript, from: usize, report: Option<&TraceReport>
             b.timestamp_ms
         );
         let _ = writeln!(s, "    intent : {}", b.intent);
+        if let Some(g) = e.revocation() {
+            let _ = writeln!(s, "    revokes: grant {g}");
+        }
         if let Some(p) = &b.payload_hash {
             let _ = writeln!(s, "    payload: {p}");
         }

@@ -1,4 +1,5 @@
-//! Authorization check (V2_DESIGN §14.8) and offline audit (§14.10).
+//! Authorization check (V2_DESIGN §14.8) and offline audit (§14.10), with
+//! grant revocation (§14.13, v2.1).
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,6 +25,8 @@ pub mod reason {
     pub const CAVEAT_VIOLATION: u8 = 6;
     /// A `MaxCalls` budget would be exceeded.
     pub const BUDGET_EXCEEDED: u8 = 7;
+    /// A grant in the chain is revoked for the call (§14.13, step 4a).
+    pub const GRANT_REVOKED: u8 = 9;
 }
 
 /// One audit finding (§14.10).
@@ -63,6 +66,25 @@ impl AuditReport {
 
 type Counters = HashMap<(H32, usize), u64>;
 
+/// Accepted revocations as `(revoker agent id, target grant id)` (§14.13 item 3).
+type Revocations = HashSet<(H32, H32)>;
+
+/// §14.13 item 3: `chain[k]` is revoked for the call iff some accepted
+/// revocation targets `id(chain[k])` and was sent by the issuer of `chain[j]`
+/// for some `j <= k` (the grant's own issuer or the issuer of an ancestor in
+/// this call's chain). Revocations by anyone else, or of grants outside the
+/// chain, have no effect.
+fn chain_revoked(gs: &[&Grant<'_>], revoked: &Revocations) -> bool {
+    if revoked.is_empty() {
+        return false;
+    }
+    gs.iter().enumerate().any(|(k, g)| {
+        gs.iter()
+            .take(k.saturating_add(1))
+            .any(|anc| revoked.contains(&(anc.issuer, g.id)))
+    })
+}
+
 struct Ctx<'a> {
     root_pk: &'a [u8],
     root_id: H32,
@@ -78,13 +100,14 @@ struct Call<'a> {
     chain: &'a [H32],
 }
 
-/// §14.8. Returns the failing reason number. Counters are incremented only on
-/// success and only when `commit`.
+/// §14.8 (+ step 4a of §14.13). Returns the failing reason number. Counters
+/// are incremented only on success and only when `commit`.
 fn authorize(
     cx: &Ctx<'_>,
     call: &Call<'_>,
     t: u64,
     executor: &Ident<'_>,
+    revoked: &Revocations,
     counts: &mut Counters,
     commit: bool,
 ) -> Result<(), u8> {
@@ -128,6 +151,10 @@ fn authorize(
     // 4. GRANT_EXPIRED
     if gs.iter().any(|g| t < g.nb || t > g.na) {
         return Err(reason::GRANT_EXPIRED);
+    }
+    // 4a. GRANT_REVOKED (§14.13), after steps 1-4 have covered the whole chain.
+    if chain_revoked(&gs, revoked) {
+        return Err(reason::GRANT_REVOKED);
     }
     // 5. CAVEAT_VIOLATION
     let exec = ExecCtx {
@@ -196,6 +223,10 @@ pub fn audit_transcript(
     let mut call_order: Vec<usize> = Vec::new();
     let mut receipted: HashSet<usize> = HashSet::new();
     let mut counts = Counters::new();
+    // §14.13 items 6-7: only kind-6 entries inside the window, and only those
+    // at indices below the receipt's index, are applied. Walking in order and
+    // inserting on arrival gives exactly that set at each receipt.
+    let mut revoked = Revocations::new();
     let mut findings = Vec::new();
 
     for (i, e) in window.iter().enumerate() {
@@ -240,7 +271,7 @@ pub fn audit_transcript(
                     chain,
                 };
                 if *status == 2 {
-                    let res = authorize(&cx, &call, e.ts, executor, &mut counts, false);
+                    let res = authorize(&cx, &call, e.ts, executor, &revoked, &mut counts, false);
                     findings.push(Finding {
                         code: "BLOCKED",
                         index: i,
@@ -248,7 +279,9 @@ pub fn audit_transcript(
                         reason: *r_reason,
                         justified: res.is_err(),
                     });
-                } else if let Err(r) = authorize(&cx, &call, e.ts, executor, &mut counts, true) {
+                } else if let Err(r) =
+                    authorize(&cx, &call, e.ts, executor, &revoked, &mut counts, true)
+                {
                     findings.push(Finding {
                         code: "EXECUTED_UNAUTHORIZED",
                         index: i,
@@ -257,6 +290,11 @@ pub fn audit_transcript(
                         justified: false,
                     });
                 }
+            }
+            // §14.13 item 6: no finding of its own; the sender passed all v1
+            // checks, and entitlement is evaluated per call.
+            Ext::Revocation { target } => {
+                revoked.insert((e.sender, *target));
             }
             Ext::None => {}
         }

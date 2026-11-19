@@ -1140,16 +1140,227 @@ fn manifest_v2_decode_rules() {
     assert_eq!(one(4, tool_call("x", b"{}", &[])), Err("DECODE"));
     assert_eq!(one(4, tool_call("x", b"{}", &[[0; 32]; 9])), Err("DECODE"));
     assert_eq!(one(4, tool_call("x", b"{}", &[[0; 32]; 8])), Ok(()));
+    // Kind 6 (§14.13): ext is exactly target[32].
     assert_eq!(one(6, vec![]), Err("DECODE"));
+    assert_eq!(one(6, vec![7; 31]), Err("DECODE"));
+    assert_eq!(one(6, vec![7; 33]), Err("DECODE"));
+    assert_eq!(one(6, vec![7; 32]), Ok(()));
+    assert_eq!(one(7, vec![7; 32]), Err("DECODE"));
     assert_eq!(one(5, receipt(&[0; 32], 3, 0)), Err("DECODE"));
     assert_eq!(one(5, receipt(&[0; 32], 0, 2)), Err("DECODE"));
     assert_eq!(one(5, receipt(&[0; 32], 2, 1)), Err("DECODE"));
-    assert_eq!(one(5, receipt(&[0; 32], 2, 9)), Err("DECODE"));
+    // §14.13 item 2: reason 9 GRANT_REVOKED is valid for status 2; 10 is not.
+    assert_eq!(one(5, receipt(&[0; 32], 2, 9)), Ok(()));
+    assert_eq!(one(5, receipt(&[0; 32], 2, 10)), Err("DECODE"));
+    assert_eq!(one(5, receipt(&[0; 32], 0, 9)), Err("DECODE"));
     let mut nz = receipt(&[0; 32], 2, 6);
     nz[40] = 1;
     assert_eq!(one(5, nz), Err("DECODE"));
     // A well-formed receipt passes v1 verification (audit then flags it as an orphan).
     assert_eq!(one(5, receipt(&[0; 32], 2, 8)), Ok(()));
+}
+
+// ------------------------------------------------------------------ revocation (§14.13)
+
+const ANY: Rcp<'static> = Rcp::Role("*");
+
+fn revocation(target: &[u8; 32]) -> Vec<u8> {
+    target.to_vec()
+}
+
+#[test]
+fn revocation_kind6_only_in_v2_manifests() {
+    let w = world();
+    let mut t = base(&w);
+    t.push_v(
+        1,
+        b"pqsub/v1/manifest",
+        &w.principal,
+        6,
+        &ANY,
+        2000,
+        &revocation(&w.g1.id),
+    );
+    let r = verify_transcript(&w.root.pk, &t.bytes(2), 0, Anchor::Genesis, None);
+    assert_eq!(r.map(|_| ()).map_err(|f| f.code), Err("DECODE"));
+    // Any recipient is accepted; a v2 container holding only a kind-6 v2 manifest
+    // (no grants) is canonical.
+    let mut t = base(&w);
+    t.grants.clear();
+    t.push(
+        &w.principal,
+        6,
+        &Rcp::Agent(&w.bank.id),
+        2000,
+        &revocation(&w.g1.id),
+    );
+    assert_eq!(audit(&w, &t), Ok(vec![]));
+}
+
+#[test]
+fn revocation_is_positional() {
+    let w = world();
+    let (a, b, p) = (&w.agent, &w.bank, &w.principal);
+    let chain = [w.g0.id, w.g1.id];
+    let call =
+        |t: &mut Tb, ts: u64| t.push(a, 4, &BANK, ts, &tool_call("get_balance", b"{}", &chain));
+    let rcpt = |t: &mut Tb, c: usize, ts: u64, status: u8, reason: u8| {
+        let h = t.hashes[c];
+        t.push(b, 5, &Rcp::Agent(&a.id), ts, &receipt(&h, status, reason))
+    };
+
+    let mut t = base(&w);
+    // 0/1: executed before the revocation: stays authorized (no backdating).
+    let c0 = call(&mut t, 2000);
+    rcpt(&mut t, c0, 2001, 0, 0);
+    // 2/3: refused with reason 9 before any revocation exists: not justified.
+    let c2 = call(&mut t, 2002);
+    rcpt(&mut t, c2, 2003, 2, 9);
+    // 4: call; 5: revocation lands between the call and its receipt; 6: receipt.
+    let c4 = call(&mut t, 2004);
+    // The revocation's own timestamp is irrelevant (an early ts cannot backdate).
+    let rev = t.push(p, 6, &ANY, 1, &revocation(&w.g1.id));
+    rcpt(&mut t, c4, 2006, 0, 0);
+    // 7/8: executed after the revocation.
+    let c7 = call(&mut t, 2007);
+    rcpt(&mut t, c7, 2008, 1, 0);
+    // 9/10: refused after the revocation: justified.
+    let c9 = call(&mut t, 2009);
+    rcpt(&mut t, c9, 2010, 2, 9);
+    assert_eq!(rev, 5);
+    assert_eq!(
+        audit(&w, &t).unwrap(),
+        vec![
+            f("BLOCKED", 3, 2, 9, false),
+            f("EXECUTED_UNAUTHORIZED", 6, 4, 9, false),
+            f("EXECUTED_UNAUTHORIZED", 8, 7, 9, false),
+            f("BLOCKED", 10, 9, 9, true),
+        ]
+    );
+    // A window starting after the revocation does not know it (item 7).
+    let a2 = audit_transcript(&w.root.pk, &t.bytes(2), 7, Anchor::Hash(t.hashes[6]), None).unwrap();
+    assert_eq!(a2.findings, vec![f("BLOCKED", 3, 2, 9, false)]);
+    assert!(a2.all_authorized());
+    // A window starting at call 4 contains the revocation and applies it.
+    let a3 = audit_transcript(&w.root.pk, &t.bytes(2), 4, Anchor::Hash(t.hashes[3]), None).unwrap();
+    assert_eq!(
+        a3.findings,
+        vec![
+            f("EXECUTED_UNAUTHORIZED", 2, 0, 9, false),
+            f("EXECUTED_UNAUTHORIZED", 4, 3, 9, false),
+            f("BLOCKED", 6, 5, 9, true),
+        ]
+    );
+
+    // A receipt pointing at a kind-6 entry is an orphan.
+    let mut t = base(&w);
+    let r = t.push(p, 6, &ANY, 2000, &revocation(&w.g1.id));
+    let h = t.hashes[r];
+    t.push(b, 5, &Rcp::Agent(&a.id), 2001, &receipt(&h, 0, 0));
+    assert_eq!(audit(&w, &t), Err("RECEIPT_ORPHAN"));
+}
+
+/// Three-grant chain root -> principal -> agent -> mail (`g2` issued by agent).
+fn sub_grant(w: &World) -> G {
+    grant(&w.agent, &w.mail.id, &w.g1.id, 0, &[])
+}
+
+#[test]
+fn revocation_entitlement() {
+    let w = world();
+    let g2 = sub_grant(&w);
+    let other = grant(&w.principal, &w.bank.id, &w.g0.id, 1, &[]);
+    let chain = [w.g0.id, w.g1.id, g2.id];
+    // Revocations (revoker, target) followed by one executed call by `mail` via chain.
+    let run = |revs: &[(&Key, [u8; 32])]| {
+        let mut t = base(&w);
+        t.grants.push(g2.bytes.clone());
+        t.grants.push(other.bytes.clone());
+        for (k, target) in revs {
+            t.push(k, 6, &ANY, 1500, &revocation(target));
+        }
+        let c = t.push(
+            &w.mail,
+            4,
+            &BANK,
+            2000,
+            &tool_call("get_balance", b"{}", &chain),
+        );
+        let h = t.hashes[c];
+        t.push(
+            &w.bank,
+            5,
+            &Rcp::Agent(&w.mail.id),
+            2001,
+            &receipt(&h, 0, 0),
+        );
+        audit(&w, &t).map(|v| v.iter().map(|f| f.reason).collect::<Vec<_>>())
+    };
+    let revoked = Ok(vec![9]);
+    let fine = Ok(vec![]);
+    assert_eq!(run(&[]), fine);
+    // Issuer of the grant itself.
+    assert_eq!(run(&[(&w.principal, w.g1.id)]), revoked);
+    assert_eq!(run(&[(&w.agent, g2.id)]), revoked);
+    // Issuer of an ancestor in this chain.
+    assert_eq!(run(&[(&w.principal, g2.id)]), revoked);
+    // A descendant cannot revoke an ancestor; no transcript identity can revoke g0.
+    assert_eq!(run(&[(&w.agent, w.g1.id)]), fine);
+    assert_eq!(run(&[(&w.principal, w.g0.id)]), fine);
+    assert_eq!(run(&[(&w.agent, w.g0.id)]), fine);
+    // The audience of a grant is not its issuer.
+    assert_eq!(run(&[(&w.mail, g2.id)]), fine);
+    // Strangers, unknown targets, and grants outside the chain have no effect.
+    assert_eq!(run(&[(&w.bank, w.g1.id)]), fine);
+    assert_eq!(run(&[(&w.principal, [5; 32])]), fine);
+    assert_eq!(run(&[(&w.principal, other.id)]), fine);
+    // Duplicates are harmless.
+    assert_eq!(
+        run(&[(&w.agent, g2.id), (&w.agent, g2.id), (&w.bank, g2.id)]),
+        revoked
+    );
+}
+
+#[test]
+fn revocation_check_order_and_budget() {
+    let w = world();
+    let g2 = sub_grant(&w);
+    let (a, b, m, p) = (&w.agent, &w.bank, &w.mail, &w.principal);
+    let short = [w.g0.id, w.g1.id];
+    let long = [w.g0.id, w.g1.id, g2.id];
+    let mut t = base(&w);
+    t.grants.push(g2.bytes.clone());
+    t.push(p, 6, &ANY, 1500, &revocation(&g2.id));
+    let exec = |t: &mut Tb, k: &Key, chain: &[[u8; 32]], args: &[u8], rts: u64| {
+        let ts = 2000 + t.entries.len() as u64;
+        let c = t.push(k, 4, &BANK, ts, &tool_call("send_money", args, chain));
+        let h = t.hashes[c];
+        t.push(b, 5, &Rcp::Agent(&k.id), rts, &receipt(&h, 0, 0));
+    };
+    // 1/2: revoked + expired at executor time -> 5 (steps 1-4 first).
+    exec(&mut t, m, &long, PAY_OK, 900_001);
+    // 3/4: revoked + caveat violation -> 9 (4a precedes 5).
+    exec(&mut t, m, &long, PAY_EVIL, 3000);
+    // 5/6: revoked + unknown grant later in the chain -> 2.
+    exec(&mut t, m, &[w.g0.id, w.g1.id, g2.id, [5; 32]], PAY_OK, 3000);
+    // 7/8, 9/10: refused via g2 never consumes the shared g1 budget (MaxCalls 2).
+    exec(&mut t, m, &long, PAY_OK, 3000);
+    exec(&mut t, m, &long, PAY_OK, 3000);
+    // 11..=16: the unrevoked chain [g0, g1] still has its full budget of 2.
+    exec(&mut t, a, &short, PAY_OK, 3000);
+    exec(&mut t, a, &short, PAY_OK, 3000);
+    exec(&mut t, a, &short, PAY_OK, 3000);
+    assert_eq!(
+        audit(&w, &t).unwrap(),
+        vec![
+            f("EXECUTED_UNAUTHORIZED", 2, 1, 5, false),
+            f("EXECUTED_UNAUTHORIZED", 4, 3, 9, false),
+            f("EXECUTED_UNAUTHORIZED", 6, 5, 2, false),
+            f("EXECUTED_UNAUTHORIZED", 8, 7, 9, false),
+            f("EXECUTED_UNAUTHORIZED", 10, 9, 9, false),
+            f("EXECUTED_UNAUTHORIZED", 16, 15, 7, false),
+        ]
+    );
 }
 
 // ------------------------------------------------------------------ vectors_v2 runner

@@ -9,6 +9,7 @@
 //!      | payload: 0x00 | 0x01 | payload_hash[32]
 //!      [v2 only, kind 4] | u8 n tool | u16 n cjson-args | u8 n (1..=8) grant_id[32]*
 //!      [v2 only, kind 5] | call_ref[32] | status u8 | reason u8 | result_hash[32]
+//!      [v2 only, kind 6] | target grant_id[32]                     (v2.1, §14.13)
 //! manifest = body | signature[3309]
 //!   ctx = "pqsub/v1/manifest" (ver 1) | "pqsub/v2/manifest" (ver 2)
 //! entry_hash = SHA3-256(u8 len(d) | d | body),  d = "pqsub/v1/entry"
@@ -46,6 +47,8 @@ pub enum ManifestKind {
     ToolCall = 4,
     /// v2: an executor-signed receipt for a tool call.
     Receipt = 5,
+    /// v2.1: revocation of a grant (§14.13).
+    Revocation = 6,
 }
 
 impl ManifestKind {
@@ -56,6 +59,7 @@ impl ManifestKind {
             (3, _) => Ok(Self::ActionRecord),
             (4, 2) => Ok(Self::ToolCall),
             (5, 2) => Ok(Self::Receipt),
+            (6, 2) => Ok(Self::Revocation),
             _ => Err(Error::Decode("unknown manifest kind")),
         }
     }
@@ -68,6 +72,7 @@ impl ManifestKind {
             Self::ActionRecord => "action-record",
             Self::ToolCall => "tool-call",
             Self::Receipt => "receipt",
+            Self::Revocation => "revocation",
         }
     }
 }
@@ -111,7 +116,7 @@ pub struct Receipt {
     pub call_ref: Hash32,
     /// Outcome.
     pub status: ReceiptStatus,
-    /// 0 if executed; gate denial number (2..=8) if refused.
+    /// 0 if executed; gate denial number (2..=9) if refused.
     pub reason: u8,
     /// Payload hash of the tool result (zero if refused).
     pub result_hash: Hash32,
@@ -128,6 +133,8 @@ pub enum Ext {
     ToolCall(ToolCall),
     /// v2 receipt (kind 5).
     Receipt(Receipt),
+    /// v2.1 revocation (kind 6): the revoked grant id.
+    Revocation(Hash32),
 }
 
 /// The signed content of a manifest.
@@ -174,12 +181,13 @@ fn validate_ext(kind: ManifestKind, ext: &Ext) -> core::result::Result<(), &'sta
         Ext::Receipt(r) if kind == ManifestKind::Receipt => match r.status {
             ReceiptStatus::ExecutedOk | ReceiptStatus::ExecutedError if r.reason == 0 => Ok(()),
             ReceiptStatus::Refused
-                if (2..=8).contains(&r.reason) && r.result_hash == Hash32::ZERO =>
+                if (2..=9).contains(&r.reason) && r.result_hash == Hash32::ZERO =>
             {
                 Ok(())
             }
             _ => Err("receipt status/reason/result inconsistent"),
         },
+        Ext::Revocation(_) if kind == ManifestKind::Revocation => Ok(()),
         _ => Err("manifest kind does not match its extension"),
     }
 }
@@ -256,6 +264,7 @@ impl ManifestBody {
                 w.u8(r.reason);
                 w.bytes(&r.result_hash.0);
             }
+            Ext::Revocation(g) => w.bytes(&g.0),
         }
         Ok(w.into_vec())
     }
@@ -313,6 +322,7 @@ impl ManifestBody {
                     result_hash,
                 })
             }
+            (_, ManifestKind::Revocation) => Ext::Revocation(Hash32(r.array()?)),
             _ => Ext::V2,
         };
         validate_ext(kind, &ext).map_err(Error::Decode)?;
@@ -443,6 +453,14 @@ impl SignedManifest {
     pub fn receipt(&self) -> Option<&Receipt> {
         match &self.body.ext {
             Ext::Receipt(r) => Some(r),
+            _ => None,
+        }
+    }
+    /// Revoked grant id, if kind 6 (§14.13).
+    #[must_use]
+    pub fn revocation(&self) -> Option<Hash32> {
+        match &self.body.ext {
+            Ext::Revocation(g) => Some(*g),
             _ => None,
         }
     }

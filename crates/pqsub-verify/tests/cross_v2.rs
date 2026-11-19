@@ -393,3 +393,88 @@ fn verifier_binary_end_to_end() {
         .contains("INVALID [BAD_SIGNATURE]"));
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+fn case_bytes(v: &Value, name: &str) -> Vec<u8> {
+    let c = v["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == name)
+        .unwrap();
+    hex::decode(c["transcript"].as_str().unwrap()).unwrap()
+}
+
+/// Byte range of the first entry's body (excluding its signature) inside a v2 transcript.
+fn first_entry_body_range(t: &[u8]) -> std::ops::Range<usize> {
+    let rd = |p: usize, k: usize| {
+        t[p..p + k]
+            .iter()
+            .fold(0usize, |a, &b| (a << 8) | b as usize)
+    };
+    let mut p = 5;
+    for width in [2usize, 2] {
+        let n = rd(p, width);
+        p += width;
+        for _ in 0..n {
+            p += 4 + rd(p, 4);
+        }
+    }
+    p += 4; // entry count
+    let len = rd(p, 4);
+    (p + 4)..(p + 4 + len - pqsub_core::SIGNATURE_LEN)
+}
+
+#[test]
+fn every_bit_of_a_revocation_audits_identically() {
+    let v = vectors();
+    let root_b = hex::decode(v["root_pk"].as_str().unwrap()).unwrap();
+    let root = PublicKey::from_bytes(&root_b).unwrap();
+    let t = case_bytes(&v, "revoked_but_executed");
+    let base = core_sig(&root, &t);
+    assert!(
+        base.contains("GRANT_REVOKED") || base.contains(", 9, false"),
+        "{base}"
+    );
+    assert_eq!(base, indep_sig(&root_b, &t));
+    for byte in first_entry_body_range(&t) {
+        for bit in 0..8 {
+            let mut x = t.clone();
+            x[byte] ^= 1 << bit;
+            let (a, b) = (core_sig(&root, &x), indep_sig(&root_b, &x));
+            assert_eq!(a, b, "byte {byte} bit {bit}");
+            assert_ne!(
+                a, base,
+                "byte {byte} bit {bit}: flip in revocation went unnoticed"
+            );
+        }
+    }
+}
+
+#[test]
+fn revocation_cases_strided_flips_agree() {
+    let v = vectors();
+    let root_b = hex::decode(v["root_pk"].as_str().unwrap()).unwrap();
+    let root = PublicKey::from_bytes(&root_b).unwrap();
+    let names = [
+        "revoked_then_refused",
+        "revoked_but_executed",
+        "revocation_not_retroactive",
+        "unentitled_revokers_ignored",
+        "ancestor_issuer_revokes_leaf",
+        "expired_reported_before_revoked",
+        "refused_revoked_without_revocation",
+    ];
+    for name in names {
+        let t = case_bytes(&v, name);
+        assert_eq!(core_sig(&root, &t), indep_sig(&root_b, &t), "{name}");
+        for bit in (0..t.len() * 8).step_by(97) {
+            let mut x = t.clone();
+            x[bit / 8] ^= 1 << (bit % 8);
+            assert_eq!(
+                core_sig(&root, &x),
+                indep_sig(&root_b, &x),
+                "{name} bit {bit}"
+            );
+        }
+    }
+}

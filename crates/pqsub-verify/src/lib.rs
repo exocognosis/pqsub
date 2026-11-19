@@ -267,6 +267,8 @@ pub(crate) enum Ext {
         status: u8,
         reason: u8,
     },
+    /// Kind 6: grant revocation (§14.13, v2.1). `target` is a grant id.
+    Revocation { target: H32 },
 }
 
 pub(crate) struct Entry<'a> {
@@ -285,7 +287,8 @@ fn parse_entry(b: &[u8], allow_v2: bool) -> Result<Entry<'_>, Failure> {
     let mut c = Cur { b, p: 0 };
     let version = c.header_versions(b"PQSM", 1, if allow_v2 { 2 } else { 1 })?;
     let kind = c.u8()?;
-    let max_kind = if version == 1 { 3 } else { 5 };
+    // v1: kinds 1..=3. v2: kinds 1..=6 (kind 6 added by §14.13).
+    let max_kind = if version == 1 { 3 } else { 6 };
     if !(1..=max_kind).contains(&kind) {
         return fail("DECODE", "kind");
     }
@@ -331,7 +334,8 @@ fn parse_entry(b: &[u8], allow_v2: bool) -> Result<Entry<'_>, Failure> {
             let result_hash = c.h32()?;
             let ok = match status {
                 0 | 1 => reason == 0,
-                2 => (2..=8).contains(&reason) && result_hash == [0u8; 32],
+                // §14.13 item 2: reason 9 GRANT_REVOKED is now allowed.
+                2 => (2..=9).contains(&reason) && result_hash == [0u8; 32],
                 _ => false,
             };
             if !ok {
@@ -343,6 +347,9 @@ fn parse_entry(b: &[u8], allow_v2: bool) -> Result<Entry<'_>, Failure> {
                 reason,
             }
         }
+        // §14.13 item 1: the ext is exactly `target[32]`; anything else
+        // fails below as truncated input or trailing bytes.
+        6 => Ext::Revocation { target: c.h32()? },
         _ => Ext::None,
     };
     let body_end = c.p;

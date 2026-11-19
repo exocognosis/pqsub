@@ -991,6 +991,19 @@ impl Tb<'_> {
         self.tb.append_ext(by, spec, receipt_ext(c, out)?, DET)?;
         Ok(())
     }
+    fn revoke(&mut self, by: &AgentKeypair, target: Hash32, ts: u64) -> Result<SignedManifest> {
+        let spec = EntrySpec {
+            kind: ManifestKind::Revocation,
+            recipient: Recipient::Role("*".into()),
+            intent: "revoke grant".into(),
+            payload_hash: None,
+            timestamp_ms: ts,
+        };
+        Ok(self
+            .tb
+            .append_ext(by, spec, Ext::Revocation(target), DET)?
+            .clone())
+    }
     fn chain(&self) -> Vec<Hash32> {
         self.w.g.iter().map(Grant::id).collect()
     }
@@ -1554,7 +1567,134 @@ fn audit_cases(w: &World) -> Result<Vec<(AuditCase, Expect)>> {
         None,
         Expect::Ok(vec![]),
     );
+    revocation_cases(w, &mut add)?;
     Ok(out)
+}
+
+/// §14.13 (v2.1) cases. Appended after the P1 cases so their bytes are unchanged.
+fn revocation_cases(
+    w: &World,
+    add: &mut impl FnMut(&str, &str, Vec<u8>, usize, String, Option<Hash32>, Expect),
+) -> Result<()> {
+    let ts = T0 + MIN;
+    let g = || "genesis".to_string();
+    let new = || Tb {
+        w,
+        tb: TraceBuilder::new(),
+    };
+    let (g1, g2) = (w.g[1].id(), w.g[2].id());
+
+    let mut t = new();
+    t.revoke(&w.principal, g1, ts)?;
+    let c = t.call(&w.agent, "bank", "send_money", PAY, t.chain(), ts + 1)?;
+    t.rcpt(&w.bank, &c, Outcome::Refused(Denial::GrantRevoked), ts + 2)?;
+    add(
+        "revoked_then_refused",
+        "issuer revokes g1; the gate refuses a later call with GRANT_REVOKED",
+        t.done(w.g.clone())?,
+        0,
+        g(),
+        None,
+        Expect::Ok(vec![f("BLOCKED", 2, 1, 9, true)]),
+    );
+
+    let mut t = new();
+    t.revoke(&w.principal, g1, ts)?;
+    let c = t.call(&w.agent, "bank", "send_money", PAY, t.chain(), ts + 1)?;
+    t.rcpt(&w.bank, &c, Outcome::Ok(b"tx-1"), ts + 2)?;
+    let tr = t.done(w.g.clone())?;
+    let first = Transcript::decode(&tr)?.entries[0].entry_hash();
+    add(
+        "revoked_but_executed",
+        "executor ignores a revocation that precedes its receipt",
+        tr.clone(),
+        0,
+        g(),
+        None,
+        Expect::Ok(vec![f("EXECUTED_UNAUTHORIZED", 2, 1, 9, false)]),
+    );
+    add(
+        "revocation_outside_window",
+        "same transcript, window starts after the revocation, so it is not applied",
+        tr,
+        1,
+        first.to_hex(),
+        None,
+        Expect::Ok(vec![]),
+    );
+
+    let mut t = new();
+    let c = t.call(&w.agent, "bank", "send_money", PAY, t.chain(), ts)?;
+    t.rcpt(&w.bank, &c, Outcome::Ok(b"tx-1"), ts + 1)?;
+    t.revoke(&w.principal, g1, ts + 2)?;
+    let c = t.call(&w.agent, "bank", "send_money", PAY, t.chain(), ts + 3)?;
+    t.rcpt(&w.bank, &c, Outcome::Refused(Denial::GrantRevoked), ts + 4)?;
+    add(
+        "revocation_not_retroactive",
+        "a receipt before the revocation stays authorized; the call after it is refused",
+        t.done(w.g.clone())?,
+        0,
+        g(),
+        None,
+        Expect::Ok(vec![f("BLOCKED", 4, 3, 9, true)]),
+    );
+
+    let mut t = new();
+    t.revoke(&w.orch, g1, ts)?;
+    t.revoke(&w.agent, g2, ts + 1)?;
+    let c = t.call(&w.agent, "bank", "send_money", PAY, t.chain(), ts + 2)?;
+    t.rcpt(&w.bank, &c, Outcome::Ok(b"tx-1"), ts + 3)?;
+    add(
+        "unentitled_revokers_ignored",
+        "the audience of g1 and the leaf holder cannot revoke g1 or g2",
+        t.done(w.g.clone())?,
+        0,
+        g(),
+        None,
+        Expect::Ok(vec![]),
+    );
+
+    let mut t = new();
+    t.revoke(&w.principal, g2, ts)?;
+    let c = t.call(&w.agent, "bank", "send_money", PAY, t.chain(), ts + 1)?;
+    t.rcpt(&w.bank, &c, Outcome::Ok(b"tx-1"), ts + 2)?;
+    add(
+        "ancestor_issuer_revokes_leaf",
+        "the issuer of an ancestor grant (g1) may revoke the leaf g2",
+        t.done(w.g.clone())?,
+        0,
+        g(),
+        None,
+        Expect::Ok(vec![f("EXECUTED_UNAUTHORIZED", 2, 1, 9, false)]),
+    );
+
+    let mut t = new();
+    t.revoke(&w.orch, g2, ts)?;
+    let c = t.call(&w.agent, "bank", "get_balance", "{}", t.chain(), ts + 1)?;
+    t.rcpt(&w.bank, &c, Outcome::Ok(b"1"), T0 + 31 * MIN)?;
+    add(
+        "expired_reported_before_revoked",
+        "a call both expired and revoked reports GRANT_EXPIRED (step 4 before 4a)",
+        t.done(w.g.clone())?,
+        0,
+        g(),
+        None,
+        Expect::Ok(vec![f("EXECUTED_UNAUTHORIZED", 2, 1, 5, false)]),
+    );
+
+    let mut t = new();
+    let c = t.call(&w.agent, "bank", "send_money", PAY, t.chain(), ts)?;
+    t.rcpt(&w.bank, &c, Outcome::Refused(Denial::GrantRevoked), ts + 1)?;
+    add(
+        "refused_revoked_without_revocation",
+        "a GRANT_REVOKED refusal with no revocation in the transcript is unjustified",
+        t.done(w.g.clone())?,
+        0,
+        g(),
+        None,
+        Expect::Ok(vec![f("BLOCKED", 1, 0, 9, false)]),
+    );
+    Ok(())
 }
 
 enum Expect {
