@@ -41,7 +41,7 @@ pqsub answers **yes**, with post-quantum signatures. An agent that has been prom
 | A buggy or dishonest executor runs a forbidden call anyway | It happened — but it's provable | `EXECUTED_UNAUTHORIZED`, exit 2 |
 | Anyone edits one bit of the transcript | — | `INVALID [BAD_SIGNATURE]`, exit 2 |
 
-[![88-second demo: the gate refuses an injected payment and an exfiltration email, and the independent verifier audits the transcript](docs/media/pqsub-demo-poster.png)](docs/media/pqsub-demo.mp4)
+https://github.com/user-attachments/assets/26eca6e3-5541-44a5-964b-258b6dbb40db
 
 *An 88-second demo: a prompt-injected assistant asks for an attacker payment and a data-exfiltration email. The executor gates refuse both, and the independent verifier shows that every executed call was authorized.* It is one continuous screen recording of a real terminal: every command shown is typed and executed, and the first command's output is revealed line by line so it can be read. There is also a [version without narration](docs/media/pqsub-demo-clean.mp4), with [separate captions](docs/media/pqsub-demo.srt). The recording and privacy-check pipeline is in [`scripts/demo-video/`](scripts/demo-video).
 
